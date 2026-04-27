@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+pump_trades.json
+pump_seen_listings.json
+*.log

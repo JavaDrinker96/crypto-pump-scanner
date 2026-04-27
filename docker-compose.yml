@@ -1,0 +1,6 @@
+services:
+  pump-scanner:
+    build: .
+    container_name: crypto-pump-scanner
+    restart: unless-stopped
+    env_file: .env
