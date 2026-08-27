@@ -1,24 +1,29 @@
 """
-DeepAlpha — Pump Detection & Riding System
-============================================
-Scans ALL Bybit USDT perpetual pairs for sudden volume/price spikes,
-rides the pump long, and shorts the dump after exhaustion.
+DeepAlpha Pump Scanner
+======================
 
-Also monitors Bybit announcements API for new listings.
+Modes:
+    PUMP_MODE=off      -> scanner disabled
+    PUMP_MODE=alerts   -> market scanning + Telegram, NO trading
+    PUMP_MODE=trading  -> market scanning + Telegram + trading
 
-Designed to run as a separate thread/process alongside the main AI bot,
-with its own risk budget (PUMP_RISK_BUDGET_PCT of total equity).
+Required for alerts:
+    TELEGRAM_TOKEN
+    TELEGRAM_CHAT_ID
 
-Usage:
-    from pump_scanner import PumpScanner
+Required for trading:
+    BYBIT_API_KEY
+    BYBIT_API_SECRET
+    TRADING_ENABLED=true
 
-    scanner = PumpScanner(exchange_client)  # ccxt bybit instance
-    scanner.start()  # launches background scanning thread
+Optional:
+    BYBIT_TESTNET=true
 """
 
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import defaultdict
@@ -29,88 +34,89 @@ from typing import Optional
 import numpy as np
 import requests
 
+
 logger = logging.getLogger("pump_scanner")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CONFIGURATION — Pump Scanner Settings
-# ═══════════════════════════════════════════════════════════════════════════
 
-# --- Detection thresholds ---
-SCAN_INTERVAL_SEC = int(os.getenv("PUMP_SCAN_INTERVAL", "3"))         # scan every 3s
-VOLUME_SPIKE_MULT = float(os.getenv("PUMP_VOL_SPIKE_MULT", "5.0"))    # 5x normal volume
-PRICE_SPIKE_PCT = float(os.getenv("PUMP_PRICE_SPIKE_PCT", "0.03"))    # 3% move in window
-PRICE_WINDOW_CANDLES = int(os.getenv("PUMP_PRICE_WINDOW", "5"))       # 5x 1m candles = 5min
-EWMA_SPAN = int(os.getenv("PUMP_EWMA_SPAN", "20"))                   # 20-period EWMA for baseline volume
-MIN_DOLLAR_VOLUME = float(os.getenv("PUMP_MIN_DOLLAR_VOL", "500000")) # ignore illiquid coins
+# ============================================================================
+# CONFIG
+# ============================================================================
 
-# --- Fakeout filter ---
-CONFIRM_CANDLES = int(os.getenv("PUMP_CONFIRM_CANDLES", "3"))         # need 3 consecutive up candles
-MIN_RSI_ENTRY = float(os.getenv("PUMP_MIN_RSI_ENTRY", "60"))         # RSI must be > 60 (momentum)
-MAX_RSI_ENTRY = float(os.getenv("PUMP_MAX_RSI_ENTRY", "85"))         # RSI < 85 (not already exhausted)
-MIN_BUY_RATIO = float(os.getenv("PUMP_MIN_BUY_RATIO", "0.65"))      # 65%+ buy-side taker volume
+PUMP_MODE = os.getenv("PUMP_MODE", "alerts").lower().strip()
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
 
-# --- Position management ---
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Scanner
+SCAN_INTERVAL_SEC = int(os.getenv("PUMP_SCAN_INTERVAL", "10"))
+VOLUME_SPIKE_MULT = float(os.getenv("PUMP_VOL_SPIKE_MULT", "5.0"))
+PRICE_SPIKE_PCT = float(os.getenv("PUMP_PRICE_SPIKE_PCT", "0.03"))
+DUMP_PRICE_SPIKE_PCT = float(os.getenv("PUMP_DUMP_PRICE_SPIKE_PCT", "0.03"))
+
+PRICE_WINDOW_CANDLES = int(os.getenv("PUMP_PRICE_WINDOW", "5"))
+MIN_DOLLAR_VOLUME = float(os.getenv("PUMP_MIN_DOLLAR_VOL", "500000"))
+
+# Pump filters
+CONFIRM_CANDLES = int(os.getenv("PUMP_CONFIRM_CANDLES", "3"))
+MIN_RSI_ENTRY = float(os.getenv("PUMP_MIN_RSI_ENTRY", "60"))
+MAX_RSI_ENTRY = float(os.getenv("PUMP_MAX_RSI_ENTRY", "85"))
+MIN_BUY_RATIO = float(os.getenv("PUMP_MIN_BUY_RATIO", "0.65"))
+
+# Dump filters
+DUMP_MAX_RSI = float(os.getenv("PUMP_DUMP_MAX_RSI", "45"))
+DUMP_MIN_SELL_RATIO = float(os.getenv("PUMP_DUMP_MIN_SELL_RATIO", "0.65"))
+
+# Trading
 PUMP_LEVERAGE = int(os.getenv("PUMP_LEVERAGE", "5"))
-PUMP_RISK_BUDGET_PCT = float(os.getenv("PUMP_RISK_BUDGET_PCT", "0.05"))  # 5% of equity for pump trades
+PUMP_RISK_BUDGET_PCT = float(os.getenv("PUMP_RISK_BUDGET_PCT", "0.05"))
 PUMP_MAX_POSITIONS = int(os.getenv("PUMP_MAX_POSITIONS", "2"))
-PUMP_SL_ATR_MULT = float(os.getenv("PUMP_SL_ATR_MULT", "1.5"))       # SL = 1.5x ATR below entry
-PUMP_TP1_PCT = float(os.getenv("PUMP_TP1_PCT", "0.05"))              # +5%  take 40%
-PUMP_TP2_PCT = float(os.getenv("PUMP_TP2_PCT", "0.10"))              # +10% take 30%
-PUMP_TP3_PCT = float(os.getenv("PUMP_TP3_PCT", "0.20"))              # +20% take remaining 30%
-PUMP_TRAILING_PCT = float(os.getenv("PUMP_TRAILING_PCT", "0.03"))     # 3% trailing after TP2
 
-# --- Dump short settings ---
-SHORT_RSI_THRESHOLD = float(os.getenv("PUMP_SHORT_RSI", "80"))        # RSI > 80 = overbought
-SHORT_VOL_DECLINE_PCT = float(os.getenv("PUMP_SHORT_VOL_DECLINE", "0.40"))  # volume drops 40%
-SHORT_FUNDING_EXTREME = float(os.getenv("PUMP_SHORT_FUNDING", "0.001"))     # funding > 0.1% = extreme
+PUMP_SL_ATR_MULT = float(os.getenv("PUMP_SL_ATR_MULT", "1.5"))
+PUMP_TP1_PCT = float(os.getenv("PUMP_TP1_PCT", "0.05"))
+PUMP_TP2_PCT = float(os.getenv("PUMP_TP2_PCT", "0.10"))
+PUMP_TP3_PCT = float(os.getenv("PUMP_TP3_PCT", "0.20"))
+PUMP_TRAILING_PCT = float(os.getenv("PUMP_TRAILING_PCT", "0.03"))
+
 SHORT_SL_ATR_MULT = float(os.getenv("PUMP_SHORT_SL_ATR", "2.0"))
-SHORT_TP_PCT = float(os.getenv("PUMP_SHORT_TP_PCT", "0.05"))          # 5% TP on short
+SHORT_TP_PCT = float(os.getenv("PUMP_SHORT_TP_PCT", "0.05"))
 
-# --- New listing detection ---
-LISTING_CHECK_INTERVAL = int(os.getenv("PUMP_LISTING_CHECK", "30"))   # check every 30s
-LISTING_BUY_DELAY_SEC = int(os.getenv("PUMP_LISTING_DELAY", "5"))     # wait 5s after detection
-LISTING_RISK_PCT = float(os.getenv("PUMP_LISTING_RISK", "0.02"))      # 2% equity per listing trade
+MIN_NOTIONAL = float(os.getenv("PUMP_MIN_NOTIONAL", "5"))
 
-# --- Telegram alerts ---
-PUMP_TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-PUMP_TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+PUMP_COOLDOWN_SEC = int(os.getenv("PUMP_COOLDOWN_SEC", "1800"))
 
-# --- Cooldown per coin (avoid re-entering same pump) ---
-PUMP_COOLDOWN_SEC = int(os.getenv("PUMP_COOLDOWN_SEC", "1800"))       # 30 min cooldown
+# New listings
+LISTING_CHECK_INTERVAL = int(os.getenv("PUMP_LISTING_CHECK", "60"))
 
-# --- Daily loss circuit breaker ---
-MAX_DAILY_PUMP_LOSS = float(os.getenv("PUMP_MAX_DAILY_LOSS", "-50"))  # stop after $50 daily loss
-
-# --- Minimum notional (Bybit minimum) ---
-MIN_NOTIONAL = float(os.getenv("PUMP_MIN_NOTIONAL", "5.0"))
-
-# --- Market cache TTL ---
-MARKET_CACHE_TTL_SEC = int(os.getenv("PUMP_MARKET_CACHE_TTL", "300"))  # 5 minutes
+# Test
+TEST_ALERT = os.getenv("PUMP_TEST_ALERT", "true").lower() == "true"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA STRUCTURES
-# ═══════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# DATA
+# ============================================================================
 
 @dataclass
 class PumpSignal:
-    """Detected pump event."""
     coin: str
-    signal_type: str              # "pump_long", "dump_short", "new_listing"
-    detected_at: float            # timestamp
+    signal_type: str
+    detected_at: float
     price_at_detection: float
-    volume_ratio: float           # current vol / baseline vol
+    volume_ratio: float
     rsi: float
     atr: float
-    confidence: float             # 0-1 composite score
+    confidence: float
     metadata: dict = field(default_factory=dict)
 
 
 @dataclass
 class PumpPosition:
-    """Active pump trade being managed."""
     coin: str
-    side: str                     # "long" or "short"
+    side: str
     entry_price: float
     quantity: float
     original_quantity: float
@@ -126,615 +132,658 @@ class PumpPosition:
     opened_at: float = 0.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CORE SCANNER CLASS
-# ═══════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# SCANNER
+# ============================================================================
 
 class PumpScanner:
-    """
-    Real-time pump detection and execution engine.
-
-    Runs as a background thread that:
-    1. Fetches 1m tickers for all USDT perps every SCAN_INTERVAL_SEC
-    2. Computes volume/price anomaly scores
-    3. Filters fakeouts via RSI, buy-ratio, consecutive candles
-    4. Opens long on confirmed pump, short on exhaustion
-    5. Manages positions with partial TP + trailing stop
-    """
 
     def __init__(self, ccxt_client, telegram_fn=None):
-        """
-        Parameters
-        ----------
-        ccxt_client : ccxt.bybit instance (already authenticated + load_markets)
-        telegram_fn : optional callable(message: str) for alerts
-        """
         self.client = ccxt_client
         self.telegram_fn = telegram_fn
+
         self._running = False
         self._thread: Optional[threading.Thread] = None
-
-        # Thread lock for shared state (Fix #5)
         self._lock = threading.Lock()
 
-        # Blacklist: stock/pre-market tokens that aren't real crypto perps
+        self._all_symbols = []
+
+        self.price_history = defaultdict(list)
+        self.volume_baselines = defaultdict(list)
+
+        self.cooldowns = {}
+        self.pump_positions = {}
+
+        self.known_listings = set()
+        self._markets_last_loaded = 0
+
+        self._last_signal_time = {}
+
         self._blacklist = {
-            'TSLA', 'TSM', 'INTC', 'HOOD', 'CHIP', 'OPG', 'AAPL', 'AMZN', 'GOOG', 'GOOGL',
-            'MSFT', 'NVDA', 'META', 'NFLX', 'AMD', 'COIN', 'MSTR', 'PLTR', 'UBER',
-            'SQ', 'PYPL', 'SHOP', 'SNOW', 'CRWD', 'NET', 'DDOG', 'ZS',
-            'BABA', 'DIS', 'BA', 'JPM', 'V', 'MA', 'WMT', 'PFE', 'KO', 'PEP',
-            'COST', 'CSCO', 'ORCL', 'CRM', 'ABNB', 'SNAP', 'PINS', 'ROKU', 'SQ',
-            'TSLAX', 'GOOGLX', 'AAPLX', 'AMZNX', 'MSFTX', 'NVDAX', 'METAX',
+            "TSLA", "TSM", "INTC", "HOOD", "CHIP", "OPG",
+            "AAPL", "AMZN", "GOOG", "GOOGL", "MSFT", "NVDA",
+            "META", "NFLX", "AMD", "COIN", "MSTR", "PLTR",
+            "UBER", "SQ", "PYPL", "SHOP", "SNOW", "CRWD",
+            "NET", "DDOG", "ZS", "BABA", "DIS", "BA", "JPM",
+            "V", "MA", "WMT", "PFE", "KO", "PEP", "COST",
+            "CSCO", "ORCL", "CRM", "ABNB", "SNAP", "PINS",
+            "ROKU",
         }
 
-        # Persistent set of already-seen listings (survives restarts)
-        self._seen_listings_file = os.path.join(os.path.dirname(__file__), "pump_seen_listings.json")
-        self._seen_listings: set[str] = set()
-        try:
-            import json as _json
-            with open(self._seen_listings_file, "r") as f:
-                self._seen_listings = set(_json.load(f))
-        except Exception:
-            pass
-
-        # State
-        self.volume_baselines: dict[str, list[float]] = defaultdict(list)  # coin -> rolling volumes
-        self.price_history: dict[str, list[float]] = defaultdict(list)     # coin -> recent closes
-        self.pump_positions: dict[str, PumpPosition] = {}                  # coin -> active position
-        self.cooldowns: dict[str, float] = {}                              # coin -> cooldown_until timestamp
-        self.known_listings: set[str] = set()                              # already-seen listing symbols
-        self._daily_pump_pnl: float = 0.0
-        self._daily_pump_pnl_date: str = ""
-
-        # Non-blocking new listing handling (Fix #4)
-        self._pending_listing: Optional[dict] = None  # {"coin": str, "time": float}
-
-        # Market cache (Fix #7)
-        self._markets_last_loaded: float = 0.0
-
-        # All USDT perp symbols (populated on start)
-        self._all_symbols: list[str] = []
-
-    # ─── Lifecycle ──────────────────────────────────────────────────────
-
-    def _safe_fetch_ohlcv(self, symbol, *args, **kwargs):
-        try:
-            return self.client.fetch_ohlcv(symbol, *args, **kwargs)
-        except Exception:
-            return []
+    # ========================================================================
+    # LIFECYCLE
+    # ========================================================================
 
     def start(self):
-        """Start the pump scanner in a background thread."""
         if self._running:
             logger.warning("PumpScanner already running")
             return
-        self._running = True
+
         self._load_all_symbols()
-        self._thread = threading.Thread(target=self._main_loop, daemon=True, name="PumpScanner")
+
+        if not self._all_symbols:
+            raise RuntimeError("No Bybit USDT perpetual symbols found")
+
+        self._running = True
+
+        self._thread = threading.Thread(
+            target=self._main_loop,
+            daemon=True,
+            name="PumpScanner",
+        )
+
         self._thread.start()
-        logger.info(f"PumpScanner started — monitoring {len(self._all_symbols)} USDT perp pairs")
-        self._alert(f"PUMP SCANNER STARTED - monitoring {len(self._all_symbols)} pairs")
+
+        logger.info(
+            "PumpScanner started | mode=%s | symbols=%d | testnet=%s",
+            PUMP_MODE,
+            len(self._all_symbols),
+            BYBIT_TESTNET,
+        )
+
+        self._alert(
+            "🟢 <b>DeepAlpha Pump Scanner ONLINE</b>\n\n"
+            f"Mode: <b>{PUMP_MODE.upper()}</b>\n"
+            f"Pairs: <b>{len(self._all_symbols)}</b>\n"
+            f"Trading: <b>{'ON' if self._trading_allowed() else 'OFF'}</b>\n"
+            f"Testnet: <b>{'YES' if BYBIT_TESTNET else 'NO'}</b>"
+        )
 
     def stop(self):
-        """Stop the scanner."""
         self._running = False
+
         if self._thread:
             self._thread.join(timeout=10)
+
         logger.info("PumpScanner stopped")
 
-    # ─── Symbol loading ────────────────────────────────────────────────
-
-    def _load_all_symbols(self):
-        """Load all active USDT linear perpetual symbols from Bybit."""
-        markets = self.client.markets or self.client.load_markets()
-        self._all_symbols = []
-        for sym, info in (markets or {}).items():
-            if (info.get("linear") and
-                info.get("active") and
-                info.get("quote") == "USDT" and
-                info.get("type") == "swap"):
-                self._all_symbols.append(sym)
-        logger.info(f"Loaded {len(self._all_symbols)} USDT perp symbols")
-
-    # ─── Main loop ────────────────────────────────────────────────────
+    # ========================================================================
+    # MAIN LOOP
+    # ========================================================================
 
     def _main_loop(self):
-        """Main scanning loop."""
         listing_check_last = 0
 
         while self._running:
             try:
                 loop_start = time.time()
 
-                # 0. Reset daily PnL at midnight UTC (Fix #9)
-                self._maybe_reset_daily_pnl()
-
-                # 1. Check new listings periodically
-                if time.time() - listing_check_last > LISTING_CHECK_INTERVAL:
-                    self._check_new_listings()
+                if time.time() - listing_check_last >= LISTING_CHECK_INTERVAL:
+                    self._check_new_symbols()
                     listing_check_last = time.time()
 
-                # 1b. Handle pending listing (non-blocking, Fix #4)
-                if self._pending_listing and time.time() >= self._pending_listing["time"]:
-                    coin = self._pending_listing["coin"]
-                    self._pending_listing = None
-                    self._execute_listing_buy(coin)
-
-                # 2. Fetch all tickers in one call (efficient)
                 tickers = self._fetch_all_tickers()
+
                 if not tickers:
                     time.sleep(SCAN_INTERVAL_SEC)
                     continue
 
-                # 3. Scan for pump signals
-                signals = self._scan_for_pumps(tickers)
+                signals = self._scan_for_signals(tickers)
 
-                # 4. Execute on confirmed signals
                 for signal in signals:
-                    self._execute_signal(signal)
+                    self._process_signal(signal)
 
-                # 5. Manage open pump positions
-                self._manage_positions(tickers)
+                if self._trading_allowed():
+                    self._manage_positions(tickers)
 
-                # 6. Sleep remaining interval
                 elapsed = time.time() - loop_start
-                sleep_time = max(0.1, SCAN_INTERVAL_SEC - elapsed)
-                time.sleep(sleep_time)
+                time.sleep(max(0.2, SCAN_INTERVAL_SEC - elapsed))
 
-            except Exception as e:
-                logger.error(f"PumpScanner main loop error: {e}", exc_info=True)
+            except Exception as exc:
+                logger.exception("PumpScanner main loop error: %s", exc)
                 time.sleep(5)
 
-    def _maybe_reset_daily_pnl(self):
-        """Reset daily PnL at midnight UTC (Fix #9)."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if self._daily_pump_pnl_date != today:
-            if self._daily_pump_pnl_date:
-                logger.info(f"Daily pump PnL reset (was ${self._daily_pump_pnl:.2f})")
-            self._daily_pump_pnl = 0.0
-            self._daily_pump_pnl_date = today
+    # ========================================================================
+    # MARKET DATA
+    # ========================================================================
 
-    # ═══════════════════════════════════════════════════════════════════
-    # A. PUMP DETECTION
-    # ═══════════════════════════════════════════════════════════════════
-
-    def _fetch_all_tickers(self) -> dict:
-        """Fetch tickers for all symbols in one API call."""
+    def _load_all_symbols(self):
         try:
-            tickers = self.client.fetch_tickers()
-            return tickers
-        except Exception as e:
-            logger.error(f"Failed to fetch tickers: {e}")
+            markets = self.client.markets or self.client.load_markets()
+        except Exception as exc:
+            logger.error("Failed to load Bybit markets: %s", exc)
+            return
+
+        self._all_symbols = []
+
+        for symbol, info in markets.items():
+            if (
+                info.get("linear")
+                and info.get("active")
+                and info.get("quote") == "USDT"
+                and info.get("type") == "swap"
+            ):
+                self._all_symbols.append(symbol)
+
+        logger.info("Loaded %d USDT perpetuals", len(self._all_symbols))
+
+    def _fetch_all_tickers(self):
+        try:
+            return self.client.fetch_tickers()
+        except Exception as exc:
+            logger.error("Failed to fetch tickers: %s", exc)
             return {}
 
-    def _scan_for_pumps(self, tickers: dict) -> list[PumpSignal]:
-        """
-        Scan all tickers for pump anomalies.
+    def _fetch_ohlcv(self, symbol, limit=30):
+        try:
+            return self.client.fetch_ohlcv(
+                symbol,
+                timeframe="1m",
+                limit=limit,
+            )
+        except Exception as exc:
+            logger.debug("OHLCV failed for %s: %s", symbol, exc)
+            return []
 
-        Detection algorithm (Fix #6 — per-candle volume detection):
-        1. Pre-filter: only coins with >10% 24h change from ticker
-        2. For those coins, fetch 1m OHLCV (20 candles)
-        3. Compare LAST candle volume to average of previous 19
-        4. If volume_ratio > VOLUME_SPIKE_MULT AND price_change > PRICE_SPIKE_PCT:
-           -> potential pump detected
-        5. Validate with RSI, consecutive candles, buy ratio
-        """
-        signals: list[PumpSignal] = []
+    # ========================================================================
+    # SIGNAL DETECTION
+    # ========================================================================
+
+    def _scan_for_signals(self, tickers):
+        signals = []
         now = time.time()
 
         for symbol, ticker in tickers.items():
-            # Only USDT linear perps
+
             if symbol not in self._all_symbols:
                 continue
 
             coin = symbol.split("/")[0]
 
-            # Skip if on cooldown
-            with self._lock:
-                if coin in self.cooldowns and now < self.cooldowns[coin]:
-                    continue
-                # Skip if already in a pump position
-                if coin in self.pump_positions:
-                    continue
+            if coin in self._blacklist:
+                continue
+
+            if self._in_cooldown(coin):
+                continue
 
             try:
-                last_price = float(ticker.get("last", 0))
-                quote_volume = float(ticker.get("quoteVolume", 0) or 0)
-                change_pct = float(ticker.get("percentage", 0) or 0) / 100  # convert to decimal
+                price = float(ticker.get("last") or 0)
+                quote_volume = float(ticker.get("quoteVolume") or 0)
 
-                if last_price <= 0 or quote_volume < MIN_DOLLAR_VOLUME:
+                if price <= 0 or quote_volume < MIN_DOLLAR_VOLUME:
                     continue
 
-                # Update price history
-                self.price_history[coin].append(last_price)
+                self.price_history[coin].append(price)
+
                 if len(self.price_history[coin]) > 100:
                     self.price_history[coin] = self.price_history[coin][-100:]
 
-                # Fix #6: Only fetch candle data for coins showing >10% 24h change
-                if abs(change_pct) < 0.10:
-                    continue
-
-                # Fetch 1m OHLCV for per-candle volume detection
-                try:
-                    candles = self._safe_fetch_ohlcv(symbol, "1m", limit=20)
-                except Exception:
-                    continue
-                if not candles or len(candles) < 5:
-                    continue
-
-                candle_volumes = [c[5] for c in candles]
-                last_candle_vol = candle_volumes[-1]
-                prev_avg_vol = np.mean(candle_volumes[:-1]) if len(candle_volumes) > 1 else 1.0
-
-                volume_ratio = last_candle_vol / max(prev_avg_vol, 1e-9)
-
-                # Store per-candle volume baseline for reference
-                with self._lock:
-                    self.volume_baselines[coin] = candle_volumes
-
-                # Price change over window
                 prices = self.price_history[coin]
-                if len(prices) >= PRICE_WINDOW_CANDLES:
-                    price_change = (prices[-1] - prices[-PRICE_WINDOW_CANDLES]) / prices[-PRICE_WINDOW_CANDLES]
-                else:
-                    price_change = change_pct
 
-                # ── PRIMARY DETECTION: volume spike + price spike ──
-                if volume_ratio >= VOLUME_SPIKE_MULT and price_change >= PRICE_SPIKE_PCT:
-                    # Validate with RSI, consecutive candles, buy ratio
-                    signal = self._validate_pump(coin, symbol, last_price, volume_ratio, price_change)
+                if len(prices) < PRICE_WINDOW_CANDLES:
+                    continue
+
+                candles = self._fetch_ohlcv(symbol, 30)
+
+                if len(candles) < 20:
+                    continue
+
+                volumes = [float(c[5]) for c in candles]
+                opens = [float(c[1]) for c in candles]
+                highs = [float(c[2]) for c in candles]
+                lows = [float(c[3]) for c in candles]
+                closes = [float(c[4]) for c in candles]
+
+                last_volume = volumes[-1]
+                baseline_volume = np.mean(volumes[:-1])
+
+                if baseline_volume <= 0:
+                    continue
+
+                volume_ratio = last_volume / baseline_volume
+
+                price_change = (
+                    prices[-1] - prices[-PRICE_WINDOW_CANDLES]
+                ) / prices[-PRICE_WINDOW_CANDLES]
+
+                rsi = self._calc_rsi(closes)
+                atr = self._calc_atr(highs, lows, closes)
+
+                self.volume_baselines[coin] = volumes
+
+                # ------------------------------------------------------------
+                # PUMP
+                # ------------------------------------------------------------
+
+                if (
+                    volume_ratio >= VOLUME_SPIKE_MULT
+                    and price_change >= PRICE_SPIKE_PCT
+                ):
+                    signal = self._validate_pump(
+                        coin=coin,
+                        symbol=symbol,
+                        price=price,
+                        volume_ratio=volume_ratio,
+                        price_change=price_change,
+                        candles=candles,
+                    )
+
+                    if signal:
+                        signals.append(signal)
+                        continue
+
+                # ------------------------------------------------------------
+                # DUMP
+                # ------------------------------------------------------------
+
+                if (
+                    volume_ratio >= VOLUME_SPIKE_MULT * 0.5
+                    and price_change <= -DUMP_PRICE_SPIKE_PCT
+                ):
+                    signal = self._validate_dump(
+                        coin=coin,
+                        symbol=symbol,
+                        price=price,
+                        volume_ratio=volume_ratio,
+                        price_change=price_change,
+                        candles=candles,
+                    )
+
                     if signal:
                         signals.append(signal)
 
-                # ── DUMP SHORT DETECTION: after a pump, detect exhaustion ──
-                elif (volume_ratio >= VOLUME_SPIKE_MULT * 0.5 and
-                      price_change >= PRICE_SPIKE_PCT * 2 and
-                      len(prices) >= 20):
-                    signal = self._check_dump_short(coin, symbol, last_price, volume_ratio)
-                    if signal:
-                        signals.append(signal)
-
-            except Exception as e:
-                logger.debug(f"Error scanning {symbol}: {e}")
-                continue
+            except Exception as exc:
+                logger.debug("Scan error %s: %s", symbol, exc)
 
         return signals
 
-    def _validate_pump(self, coin: str, symbol: str, price: float,
-                       volume_ratio: float, price_change: float) -> Optional[PumpSignal]:
-        """
-        Validate a potential pump signal using 1m candle data.
+    # ========================================================================
+    # PUMP VALIDATION
+    # ========================================================================
 
-        Checks:
-        1. Consecutive green candles (CONFIRM_CANDLES)
-        2. RSI in the sweet spot (60-85)
-        3. Buy-side volume dominance
-        4. ATR for stop-loss calculation
-        """
-        try:
-            candles = self._safe_fetch_ohlcv(symbol, "1m", limit=30)
-            if not candles or len(candles) < 15:
-                return None
+    def _validate_pump(
+        self,
+        coin,
+        symbol,
+        price,
+        volume_ratio,
+        price_change,
+        candles,
+    ):
+        opens = [float(c[1]) for c in candles]
+        highs = [float(c[2]) for c in candles]
+        lows = [float(c[3]) for c in candles]
+        closes = [float(c[4]) for c in candles]
+        volumes = [float(c[5]) for c in candles]
 
-            closes = [c[4] for c in candles]
-            opens = [c[1] for c in candles]
-            highs = [c[2] for c in candles]
-            lows = [c[3] for c in candles]
-            volumes = [c[5] for c in candles]
+        green_count = sum(
+            1
+            for i in range(-CONFIRM_CANDLES, 0)
+            if closes[i] > opens[i]
+        )
 
-            # 1. Consecutive green candles check
-            green_count = 0
-            for i in range(-1, -CONFIRM_CANDLES - 1, -1):
-                if closes[i] > opens[i]:
-                    green_count += 1
-            if green_count < CONFIRM_CANDLES:
-                return None
-
-            # 2. RSI calculation (14-period)
-            rsi = self._calc_rsi(closes, period=14)
-            if rsi < MIN_RSI_ENTRY or rsi > MAX_RSI_ENTRY:
-                return None
-
-            # 3. Buy ratio: fraction of volume on green candles in last 5
-            green_vol = sum(volumes[i] for i in range(-5, 0) if closes[i] > opens[i])
-            total_vol = sum(volumes[-5:])
-            buy_ratio = green_vol / max(total_vol, 1e-9)
-            if buy_ratio < MIN_BUY_RATIO:
-                return None
-
-            # 4. ATR calculation (14-period)
-            atr = self._calc_atr(highs, lows, closes, period=14)
-
-            # 5. Confidence scoring (0-1)
-            conf_vol = min(volume_ratio / (VOLUME_SPIKE_MULT * 2), 1.0)   # higher vol = better
-            conf_price = min(price_change / (PRICE_SPIKE_PCT * 3), 1.0)   # bigger move = better
-            conf_rsi = 1.0 - abs(rsi - 70) / 30                          # sweet spot around 70
-            conf_buy = min(buy_ratio / 0.8, 1.0)                          # higher buy ratio = better
-            confidence = (conf_vol * 0.3 + conf_price * 0.3 +
-                         conf_rsi * 0.2 + conf_buy * 0.2)
-
-            if confidence < 0.5:
-                return None
-
-            logger.info(
-                f"PUMP DETECTED: {coin} | vol_ratio={volume_ratio:.1f}x | "
-                f"price_change={price_change*100:.1f}% | RSI={rsi:.0f} | "
-                f"buy_ratio={buy_ratio:.0%} | confidence={confidence:.2f}"
-            )
-
-            return PumpSignal(
-                coin=coin,
-                signal_type="pump_long",
-                detected_at=time.time(),
-                price_at_detection=price,
-                volume_ratio=volume_ratio,
-                rsi=rsi,
-                atr=atr,
-                confidence=confidence,
-                metadata={
-                    "price_change": price_change,
-                    "buy_ratio": buy_ratio,
-                    "green_candles": green_count,
-                },
-            )
-
-        except Exception as e:
-            logger.error(f"Pump validation failed for {coin}: {e}")
+        if green_count < CONFIRM_CANDLES:
             return None
 
-    def _check_dump_short(self, coin: str, symbol: str, price: float,
-                          volume_ratio: float) -> Optional[PumpSignal]:
-        """
-        Detect pump exhaustion for a short entry.
+        rsi = self._calc_rsi(closes)
 
-        Exhaustion signals:
-        1. RSI > 80 (overbought)
-        2. Volume declining from peak (bearish divergence)
-        3. Funding rate extreme (> 0.1%)
-        4. Long upper wicks on recent candles (rejection)
-        """
-        try:
-            candles = self._safe_fetch_ohlcv(symbol, "1m", limit=30)
-            if not candles or len(candles) < 20:
-                return None
-
-            closes = [c[4] for c in candles]
-            opens = [c[1] for c in candles]
-            highs = [c[2] for c in candles]
-            lows = [c[3] for c in candles]
-            volumes = [c[5] for c in candles]
-
-            # 1. RSI must be overbought
-            rsi = self._calc_rsi(closes, period=14)
-            if rsi < SHORT_RSI_THRESHOLD:
-                return None
-
-            # 2. Volume declining: compare last 5 candles avg vs peak 5 candles
-            recent_vol = np.mean(volumes[-5:])
-            peak_vol = np.max([np.mean(volumes[i:i+5]) for i in range(len(volumes)-10, len(volumes)-5)])
-            vol_decline = 1 - (recent_vol / max(peak_vol, 1e-9))
-            if vol_decline < SHORT_VOL_DECLINE_PCT:
-                return None
-
-            # 3. Check funding rate
-            try:
-                funding_data = self.client.fetch_funding_rate(symbol)
-                funding = float(funding_data.get("fundingRate", 0))
-            except Exception:
-                funding = 0
-
-            # 4. Upper wick ratio on last 3 candles (rejection signal)
-            wick_scores = []
-            for i in range(-3, 0):
-                body = abs(closes[i] - opens[i])
-                upper_wick = highs[i] - max(closes[i], opens[i])
-                total_range = highs[i] - lows[i]
-                if total_range > 0:
-                    wick_scores.append(upper_wick / total_range)
-            avg_wick = np.mean(wick_scores) if wick_scores else 0
-
-            # Composite exhaustion score
-            score_rsi = min((rsi - 75) / 20, 1.0)
-            score_vol = min(vol_decline / 0.6, 1.0)
-            score_funding = min(abs(funding) / SHORT_FUNDING_EXTREME, 1.0) if funding > 0 else 0
-            score_wick = min(avg_wick / 0.5, 1.0)
-
-            confidence = (score_rsi * 0.3 + score_vol * 0.3 +
-                         score_funding * 0.2 + score_wick * 0.2)
-
-            if confidence < 0.5:
-                return None
-
-            atr = self._calc_atr(highs, lows, closes, period=14)
-
-            logger.info(
-                f"DUMP SHORT SIGNAL: {coin} | RSI={rsi:.0f} | "
-                f"vol_decline={vol_decline:.0%} | funding={funding:.4%} | "
-                f"wick_ratio={avg_wick:.2f} | confidence={confidence:.2f}"
-            )
-
-            return PumpSignal(
-                coin=coin,
-                signal_type="dump_short",
-                detected_at=time.time(),
-                price_at_detection=price,
-                volume_ratio=volume_ratio,
-                rsi=rsi,
-                atr=atr,
-                confidence=confidence,
-                metadata={
-                    "vol_decline": vol_decline,
-                    "funding": funding,
-                    "avg_wick": avg_wick,
-                },
-            )
-
-        except Exception as e:
-            logger.error(f"Dump short check failed for {coin}: {e}")
+        if rsi < MIN_RSI_ENTRY or rsi > MAX_RSI_ENTRY:
             return None
 
-    # ═══════════════════════════════════════════════════════════════════
-    # B. TRADE EXECUTION
-    # ═══════════════════════════════════════════════════════════════════
+        green_volume = sum(
+            volumes[i]
+            for i in range(-5, 0)
+            if closes[i] > opens[i]
+        )
 
-    def _execute_signal(self, signal: PumpSignal):
-        """Execute a pump/dump/listing signal."""
-        # Check budget
+        total_volume = sum(volumes[-5:])
+
+        buy_ratio = green_volume / max(total_volume, 1e-9)
+
+        if buy_ratio < MIN_BUY_RATIO:
+            return None
+
+        atr = self._calc_atr(highs, lows, closes)
+
+        confidence = self._pump_confidence(
+            volume_ratio,
+            price_change,
+            rsi,
+            buy_ratio,
+        )
+
+        if confidence < 0.5:
+            return None
+
+        return PumpSignal(
+            coin=coin,
+            signal_type="pump",
+            detected_at=time.time(),
+            price_at_detection=price,
+            volume_ratio=volume_ratio,
+            rsi=rsi,
+            atr=atr,
+            confidence=confidence,
+            metadata={
+                "price_change": price_change,
+                "buy_ratio": buy_ratio,
+                "green_candles": green_count,
+            },
+        )
+
+    # ========================================================================
+    # DUMP VALIDATION
+    # ========================================================================
+
+    def _validate_dump(
+        self,
+        coin,
+        symbol,
+        price,
+        volume_ratio,
+        price_change,
+        candles,
+    ):
+        opens = [float(c[1]) for c in candles]
+        highs = [float(c[2]) for c in candles]
+        lows = [float(c[3]) for c in candles]
+        closes = [float(c[4]) for c in candles]
+        volumes = [float(c[5]) for c in candles]
+
+        rsi = self._calc_rsi(closes)
+
+        if rsi > DUMP_MAX_RSI:
+            # A very high RSI means the move may still be pump/exhaustion,
+            # not a confirmed downside dump.
+            return None
+
+        red_volume = sum(
+            volumes[i]
+            for i in range(-5, 0)
+            if closes[i] < opens[i]
+        )
+
+        total_volume = sum(volumes[-5:])
+
+        sell_ratio = red_volume / max(total_volume, 1e-9)
+
+        if sell_ratio < DUMP_MIN_SELL_RATIO:
+            return None
+
+        red_count = sum(
+            1
+            for i in range(-CONFIRM_CANDLES, 0)
+            if closes[i] < opens[i]
+        )
+
+        if red_count < CONFIRM_CANDLES:
+            return None
+
+        atr = self._calc_atr(highs, lows, closes)
+
+        volume_score = min(volume_ratio / (VOLUME_SPIKE_MULT * 2), 1.0)
+        price_score = min(
+            abs(price_change) / (DUMP_PRICE_SPIKE_PCT * 3),
+            1.0,
+        )
+        sell_score = min(sell_ratio / 0.8, 1.0)
+
+        rsi_score = min(
+            max((50 - rsi) / 30, 0),
+            1.0,
+        )
+
+        confidence = (
+            volume_score * 0.30
+            + price_score * 0.30
+            + sell_score * 0.25
+            + rsi_score * 0.15
+        )
+
+        if confidence < 0.5:
+            return None
+
+        return PumpSignal(
+            coin=coin,
+            signal_type="dump",
+            detected_at=time.time(),
+            price_at_detection=price,
+            volume_ratio=volume_ratio,
+            rsi=rsi,
+            atr=atr,
+            confidence=confidence,
+            metadata={
+                "price_change": price_change,
+                "sell_ratio": sell_ratio,
+                "red_candles": red_count,
+            },
+        )
+
+    # ========================================================================
+    # SIGNAL PROCESSING
+    # ========================================================================
+
+    def _process_signal(self, signal):
+        coin = signal.coin
+
+        # Prevent repeated signals
+        last_time = self._last_signal_time.get(
+            (coin, signal.signal_type),
+            0,
+        )
+
+        if time.time() - last_time < PUMP_COOLDOWN_SEC:
+            return
+
+        self._last_signal_time[(coin, signal.signal_type)] = time.time()
+
+        logger.info(
+            "%s detected: %s | price=%.8f | volume=%.1fx | RSI=%.1f | confidence=%.0f%%",
+            signal.signal_type.upper(),
+            coin,
+            signal.price_at_detection,
+            signal.volume_ratio,
+            signal.rsi,
+            signal.confidence * 100,
+        )
+
+        # Telegram always receives signal
+        self._send_signal_alert(signal)
+
+        # Trading only in explicit trading mode
+        if self._trading_allowed():
+            self._execute_signal(signal)
+
+    def _send_signal_alert(self, signal):
+        coin = signal.coin
+
+        if signal.signal_type == "pump":
+            emoji = "🚀"
+            title = "PUMP DETECTED"
+            direction = "UP"
+        else:
+            emoji = "🔻"
+            title = "DUMP DETECTED"
+            direction = "DOWN"
+
+        price_change = signal.metadata.get("price_change", 0)
+        buy_ratio = signal.metadata.get("buy_ratio")
+        sell_ratio = signal.metadata.get("sell_ratio")
+
+        lines = [
+            f"{emoji} <b>{title}</b>",
+            "",
+            f"🪙 <b>{coin}</b>",
+            f"💰 Price: <code>{self._format_price(signal.price_at_detection)}</code>",
+            f"📈 Move: <b>{price_change:+.2%}</b>",
+            f"📊 Volume: <b>{signal.volume_ratio:.1f}x</b>",
+            f"📉 RSI: <b>{signal.rsi:.1f}</b>",
+            f"🎯 Confidence: <b>{signal.confidence:.0%}</b>",
+        ]
+
+        if buy_ratio is not None:
+            lines.append(f"🟢 Buy ratio: <b>{buy_ratio:.0%}</b>")
+
+        if sell_ratio is not None:
+            lines.append(f"🔴 Sell ratio: <b>{sell_ratio:.0%}</b>")
+
+        lines.extend(
+            [
+                "",
+                f"Direction: <b>{direction}</b>",
+                f"Mode: <b>{PUMP_MODE.upper()}</b>",
+            ]
+        )
+
+        if not self._trading_allowed():
+            lines.append("⚪ Trading: <b>OFF</b>")
+
+        self._alert("\n".join(lines))
+
+    # ========================================================================
+    # TRADING
+    # ========================================================================
+
+    def _trading_allowed(self):
+        return (
+            PUMP_MODE == "trading"
+            and TRADING_ENABLED
+            and bool(BYBIT_API_KEY)
+            and bool(BYBIT_API_SECRET)
+        )
+
+    def _execute_signal(self, signal):
         with self._lock:
             if len(self.pump_positions) >= PUMP_MAX_POSITIONS:
-                logger.info(f"Max pump positions reached, skipping {signal.coin}")
+                logger.info("Maximum positions reached")
                 return
 
-        # Fix #13: Daily loss circuit breaker
-        if self._daily_pump_pnl <= MAX_DAILY_PUMP_LOSS:
-            logger.warning(f"Daily pump loss limit reached (${self._daily_pump_pnl:.2f}), skipping {signal.coin}")
-            return
-
-        # Verify coin has a tradable linear perpetual contract on Bybit FIRST
-        symbol = f"{signal.coin}/USDT:USDT"
-        markets = self.client.markets or {}
-        if symbol not in markets:
-            try:
-                self.client.load_markets(True)
-                markets = self.client.markets or {}
-            except Exception:
-                pass
-        market_info = markets.get(symbol, {})
-        is_tradable = (
-            symbol in markets
-            and market_info.get("active", False)
-            and market_info.get("linear", False)
-        )
-        if not is_tradable:
-            # Try a test fetch to be sure
-            try:
-                self.client.fetch_ticker(symbol)
-            except Exception:
-                logger.info(f"No tradable perpetual for {signal.coin}, skipping (24h cooldown)")
-                with self._lock:
-                    self.cooldowns[signal.coin] = time.time() + 86400
-                return
-
-        # Fix #18: Position conflict with main bot
-        if self._main_bot_has_position(signal.coin):
-            logger.info(f"Main bot already has position on {signal.coin}, skipping")
-            return
-
-        try:
-            equity = self._get_equity()
-            if equity <= 0:
-                return
-
-            if signal.signal_type == "pump_long":
-                self._open_pump_long(signal, equity)
-            elif signal.signal_type == "dump_short":
-                self._open_dump_short(signal, equity)
-            elif signal.signal_type == "new_listing":
-                self._open_listing_long(signal, equity)
-
-        except Exception as e:
-            logger.error(f"Failed to execute signal for {signal.coin}: {e}")
-            # Set cooldown on failure to stop retrying every 3 seconds
-            with self._lock:
-                if "not supported" in str(e) or "not allowed" in str(e):
-                    self.cooldowns[signal.coin] = time.time() + 86400  # 24h for unsupported symbols
-                else:
-                    self.cooldowns[signal.coin] = time.time() + 300  # 5min for other errors
-
-    def _main_bot_has_position(self, coin: str) -> bool:
-        """Fix #18: Check if the main bot already has a position on this coin."""
-        try:
-            # Check exchange positions directly
-            symbol = f"{coin}/USDT:USDT"
-            positions = self.client.fetch_positions([symbol])
-            for p in positions:
-                contracts = float(p.get("contracts", 0) or 0)
-                if contracts > 0 and p.get("symbol") == symbol:
-                    # Position exists — could be main bot's
-                    with self._lock:
-                        if coin not in self.pump_positions:
-                            # Not ours, must be main bot's
-                            return True
-        except Exception as e:
-            logger.debug(f"Position conflict check failed for {coin}: {e}")
-        return False
-
-    def _open_pump_long(self, signal: PumpSignal, equity: float):
-        """Open a long position to ride the pump."""
         coin = signal.coin
         symbol = f"{coin}/USDT:USDT"
-        price = signal.price_at_detection
-        atr = signal.atr
 
-        # Position sizing: scale with confidence, capped at PUMP_RISK_BUDGET_PCT
-        risk_frac = PUMP_RISK_BUDGET_PCT * signal.confidence
-        notional = equity * risk_frac * PUMP_LEVERAGE
-        quantity = notional / price
+        try:
+            markets = self.client.markets or {}
 
-        # Round quantity to exchange precision
+            market = markets.get(symbol)
+
+            if not market:
+                self.client.load_markets(True)
+                market = self.client.markets.get(symbol)
+
+            if not market or not market.get("active"):
+                logger.info("Symbol not tradable: %s", symbol)
+                return
+
+            equity = self._get_equity()
+
+            if equity <= 0:
+                logger.warning("No USDT equity available")
+                return
+
+            if signal.signal_type == "pump":
+                self._open_long(signal, equity)
+
+            elif signal.signal_type == "dump":
+                self._open_short(signal, equity)
+
+        except Exception as exc:
+            logger.exception(
+                "Trade execution failed for %s: %s",
+                coin,
+                exc,
+            )
+
+    def _open_long(self, signal, equity):
+        coin = signal.coin
+        symbol = f"{coin}/USDT:USDT"
+
+        risk_fraction = PUMP_RISK_BUDGET_PCT * signal.confidence
+
+        notional = equity * risk_fraction * PUMP_LEVERAGE
+        quantity = notional / signal.price_at_detection
+
         quantity = self._round_qty(symbol, quantity)
-        if quantity <= 0:
+
+        if quantity <= 0 or notional < MIN_NOTIONAL:
             return
 
-        # Fix #10: Minimum notional check
-        if notional < MIN_NOTIONAL:
-            logger.info(f"Notional ${notional:.2f} below minimum ${MIN_NOTIONAL}, skipping {coin}")
-            return
-
-        # Set leverage
         try:
             self.client.set_leverage(PUMP_LEVERAGE, symbol)
         except Exception:
-            pass  # may already be set
+            pass
 
-        # Place market buy
-        order = self.client.create_market_order(symbol, "buy", quantity)
-        fill_price = float(order.get("average", price) or price)
+        order = self.client.create_market_order(
+            symbol,
+            "buy",
+            quantity,
+        )
 
-        # Calculate SL/TP levels
-        sl = fill_price - (atr * PUMP_SL_ATR_MULT)
+        fill_price = float(
+            order.get("average")
+            or signal.price_at_detection
+        )
+
+        atr = signal.atr or fill_price * 0.02
+
+        stop_loss = fill_price - atr * PUMP_SL_ATR_MULT
         tp1 = fill_price * (1 + PUMP_TP1_PCT)
         tp2 = fill_price * (1 + PUMP_TP2_PCT)
         tp3 = fill_price * (1 + PUMP_TP3_PCT)
 
-        pos = PumpPosition(
-            coin=coin, side="long",
-            entry_price=fill_price, quantity=quantity,
+        position = PumpPosition(
+            coin=coin,
+            side="long",
+            entry_price=fill_price,
+            quantity=quantity,
             original_quantity=quantity,
-            stop_loss=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+            stop_loss=stop_loss,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
             opened_at=time.time(),
         )
+
         with self._lock:
-            self.pump_positions[coin] = pos
+            self.pump_positions[coin] = position
 
-        msg = (
-            f"PUMP LONG OPENED: {coin}\n"
-            f"Entry: ${fill_price:.4f} | Qty: {quantity}\n"
-            f"SL: ${sl:.4f} | TP1: ${tp1:.4f} | TP2: ${tp2:.4f} | TP3: ${tp3:.4f}\n"
-            f"Vol ratio: {signal.volume_ratio:.1f}x | RSI: {signal.rsi:.0f} | "
-            f"Conf: {signal.confidence:.0%}\n"
-            f"Notional: ${notional:.0f} | Leverage: {PUMP_LEVERAGE}x"
+        self._alert(
+            f"🟢 <b>PUMP LONG OPENED</b>\n\n"
+            f"🪙 {coin}\n"
+            f"Entry: <code>{self._format_price(fill_price)}</code>\n"
+            f"Qty: <code>{quantity}</code>\n"
+            f"SL: <code>{self._format_price(stop_loss)}</code>\n"
+            f"TP1: <code>{self._format_price(tp1)}</code>\n"
+            f"TP2: <code>{self._format_price(tp2)}</code>\n"
+            f"TP3: <code>{self._format_price(tp3)}</code>\n"
+            f"Leverage: {PUMP_LEVERAGE}x"
         )
-        logger.info(msg)
-        self._alert(msg)
 
-    def _open_dump_short(self, signal: PumpSignal, equity: float):
-        """Open a short position after pump exhaustion."""
+    def _open_short(self, signal, equity):
         coin = signal.coin
         symbol = f"{coin}/USDT:USDT"
-        price = signal.price_at_detection
-        atr = signal.atr
 
-        risk_frac = PUMP_RISK_BUDGET_PCT * signal.confidence * 0.7  # smaller size for shorts
-        notional = equity * risk_frac * PUMP_LEVERAGE
-        quantity = notional / price
+        risk_fraction = (
+            PUMP_RISK_BUDGET_PCT
+            * signal.confidence
+            * 0.7
+        )
+
+        notional = equity * risk_fraction * PUMP_LEVERAGE
+        quantity = notional / signal.price_at_detection
+
         quantity = self._round_qty(symbol, quantity)
-        if quantity <= 0:
-            return
 
-        # Fix #10: Minimum notional check
-        if notional < MIN_NOTIONAL:
-            logger.info(f"Notional ${notional:.2f} below minimum ${MIN_NOTIONAL}, skipping short {coin}")
+        if quantity <= 0 or notional < MIN_NOTIONAL:
             return
 
         try:
@@ -742,621 +791,820 @@ class PumpScanner:
         except Exception:
             pass
 
-        order = self.client.create_market_order(symbol, "sell", quantity)
-        fill_price = float(order.get("average", price) or price)
+        order = self.client.create_market_order(
+            symbol,
+            "sell",
+            quantity,
+        )
 
-        sl = fill_price + (atr * SHORT_SL_ATR_MULT)
+        fill_price = float(
+            order.get("average")
+            or signal.price_at_detection
+        )
+
+        atr = signal.atr or fill_price * 0.02
+
+        stop_loss = fill_price + atr * SHORT_SL_ATR_MULT
+
         tp1 = fill_price * (1 - SHORT_TP_PCT * 0.5)
         tp2 = fill_price * (1 - SHORT_TP_PCT)
         tp3 = fill_price * (1 - SHORT_TP_PCT * 1.5)
 
-        pos = PumpPosition(
-            coin=coin, side="short",
-            entry_price=fill_price, quantity=quantity,
+        position = PumpPosition(
+            coin=coin,
+            side="short",
+            entry_price=fill_price,
+            quantity=quantity,
             original_quantity=quantity,
-            stop_loss=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+            stop_loss=stop_loss,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
             opened_at=time.time(),
         )
+
         with self._lock:
-            self.pump_positions[coin] = pos
+            self.pump_positions[coin] = position
 
-        msg = (
-            f"DUMP SHORT OPENED: {coin}\n"
-            f"Entry: ${fill_price:.4f} | Qty: {quantity}\n"
-            f"SL: ${sl:.4f} | TP: ${tp2:.4f}\n"
-            f"RSI: {signal.rsi:.0f} | Vol decline: {signal.metadata.get('vol_decline', 0):.0%}\n"
-            f"Funding: {signal.metadata.get('funding', 0):.4%}"
+        self._alert(
+            f"🔴 <b>DUMP SHORT OPENED</b>\n\n"
+            f"🪙 {coin}\n"
+            f"Entry: <code>{self._format_price(fill_price)}</code>\n"
+            f"Qty: <code>{quantity}</code>\n"
+            f"SL: <code>{self._format_price(stop_loss)}</code>\n"
+            f"TP: <code>{self._format_price(tp2)}</code>\n"
+            f"Leverage: {PUMP_LEVERAGE}x"
         )
-        logger.info(msg)
-        self._alert(msg)
 
-    def _open_listing_long(self, signal: PumpSignal, equity: float):
-        """Open a long position on a newly listed coin."""
-        coin = signal.coin
-        symbol = f"{coin}/USDT:USDT"
-        price = signal.price_at_detection
+    # ========================================================================
+    # POSITION MANAGEMENT
+    # ========================================================================
 
-        notional = equity * LISTING_RISK_PCT * PUMP_LEVERAGE
-        quantity = notional / price
-        quantity = self._round_qty(symbol, quantity)
-        if quantity <= 0:
-            return
-
-        # Fix #10: Minimum notional check
-        if notional < MIN_NOTIONAL:
-            logger.info(f"Notional ${notional:.2f} below minimum ${MIN_NOTIONAL}, skipping listing {coin}")
-            return
-
-        try:
-            self.client.set_leverage(PUMP_LEVERAGE, symbol)
-        except Exception:
-            pass
-
-        order = self.client.create_market_order(symbol, "buy", quantity)
-        fill_price = float(order.get("average", price) or price)
-
-        # New listings: tight SL (5%), aggressive TP
-        sl = fill_price * 0.95
-        tp1 = fill_price * 1.10
-        tp2 = fill_price * 1.25
-        tp3 = fill_price * 1.50
-
-        pos = PumpPosition(
-            coin=coin, side="long",
-            entry_price=fill_price, quantity=quantity,
-            original_quantity=quantity,
-            stop_loss=sl, tp1=tp1, tp2=tp2, tp3=tp3,
-            opened_at=time.time(),
-        )
+    def _manage_positions(self, tickers):
         with self._lock:
-            self.pump_positions[coin] = pos
+            positions = list(self.pump_positions.items())
 
-        msg = (
-            f"NEW LISTING LONG: {coin}\n"
-            f"Entry: ${fill_price:.4f} | Qty: {quantity}\n"
-            f"SL: ${sl:.4f} (-5%) | TP1: ${tp1:.4f} (+10%)"
-        )
-        logger.info(msg)
-        self._alert(msg)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # C. POSITION MANAGEMENT — Partial TP + Trailing Stop
-    # ═══════════════════════════════════════════════════════════════════
-
-    def _manage_positions(self, tickers: dict):
-        """Check all pump positions for SL/TP/trailing."""
-        with self._lock:
-            positions_snapshot = list(self.pump_positions.items())
-
-        for coin, pos in positions_snapshot:
+        for coin, position in positions:
             symbol = f"{coin}/USDT:USDT"
+
             ticker = tickers.get(symbol)
+
             if not ticker:
                 continue
 
-            current_price = float(ticker.get("last", 0))
+            current_price = float(ticker.get("last") or 0)
+
             if current_price <= 0:
                 continue
 
-            is_long = pos.side == "long"
+            is_long = position.side == "long"
 
-            # ── STOP LOSS ──
-            if is_long and current_price <= pos.stop_loss:
-                self._close_pump_position(coin, "SL HIT", current_price)
-                continue
-            elif not is_long and current_price >= pos.stop_loss:
-                self._close_pump_position(coin, "SL HIT", current_price)
-                continue
-
-            # ── TIME-BASED EXIT: close after 2 hours max ──
-            if time.time() - pos.opened_at > 7200:
-                self._close_pump_position(coin, "TIME EXIT (2h)", current_price)
+            # Stop
+            if is_long and current_price <= position.stop_loss:
+                self._close_position(
+                    coin,
+                    current_price,
+                    "STOP LOSS",
+                )
                 continue
 
-            # ── PARTIAL TAKE PROFITS (long) — Fix #2: separate if blocks ──
+            if not is_long and current_price >= position.stop_loss:
+                self._close_position(
+                    coin,
+                    current_price,
+                    "STOP LOSS",
+                )
+                continue
+
+            # Maximum lifetime: 2h
+            if time.time() - position.opened_at > 7200:
+                self._close_position(
+                    coin,
+                    current_price,
+                    "TIME EXIT",
+                )
+                continue
+
             if is_long:
-                if not pos.tp1_hit and current_price >= pos.tp1:
-                    # TP1: close 40% of position
-                    close_qty = self._round_qty(symbol, pos.original_quantity * 0.4)
-                    close_qty = min(close_qty, pos.quantity)  # clamp to remaining
-                    if close_qty > 0:
-                        self._partial_close(coin, symbol, close_qty, "TP1 (+5%)")
-                        pos.quantity = max(0, pos.quantity - close_qty)  # Fix #3
-                        pos.tp1_hit = True
-                        # Move SL to breakeven
-                        pos.stop_loss = pos.entry_price * 1.002  # slight profit lock
-
-                if not pos.tp2_hit and pos.tp1_hit and current_price >= pos.tp2:
-                    # TP2: close 30% of position, activate trailing
-                    close_qty = self._round_qty(symbol, pos.original_quantity * 0.3)
-                    close_qty = min(close_qty, pos.quantity)  # clamp to remaining
-                    if close_qty > 0:
-                        self._partial_close(coin, symbol, close_qty, "TP2 (+10%)")
-                        pos.quantity = max(0, pos.quantity - close_qty)  # Fix #3
-                        pos.tp2_hit = True
-                        pos.trailing_active = True
-                        pos.trailing_high = current_price
-
-                if not pos.tp3_hit and pos.tp2_hit and current_price >= pos.tp3:
-                    # TP3: close remaining
-                    pos.tp3_hit = True
-                    self._close_pump_position(coin, "TP3 (+20%)", current_price)
-                    continue
-
-                # Trailing stop after TP2
-                if pos.trailing_active:
-                    if current_price > pos.trailing_high:
-                        pos.trailing_high = current_price
-                    trailing_sl = pos.trailing_high * (1 - PUMP_TRAILING_PCT)
-                    if current_price <= trailing_sl:
-                        self._close_pump_position(coin, "TRAILING STOP", current_price)
-                        continue
-
-            # ── PARTIAL TAKE PROFITS (short) — Fix #2: separate if blocks ──
+                self._manage_long_position(
+                    position,
+                    symbol,
+                    current_price,
+                )
             else:
-                if not pos.tp1_hit and current_price <= pos.tp1:
-                    close_qty = self._round_qty(symbol, pos.original_quantity * 0.4)
-                    close_qty = min(close_qty, pos.quantity)  # clamp to remaining
-                    if close_qty > 0:
-                        self._partial_close_short(coin, symbol, close_qty, "TP1")
-                        pos.quantity = max(0, pos.quantity - close_qty)  # Fix #3
-                        pos.tp1_hit = True
-                        pos.stop_loss = pos.entry_price * 0.998
+                self._manage_short_position(
+                    position,
+                    symbol,
+                    current_price,
+                )
 
-                if not pos.tp2_hit and pos.tp1_hit and current_price <= pos.tp2:
-                    close_qty = self._round_qty(symbol, pos.original_quantity * 0.3)
-                    if close_qty > 0:
-                        self._partial_close_short(coin, symbol, close_qty, "TP2")
-                        pos.quantity = max(0, pos.quantity - close_qty)  # Fix #3
-                        pos.tp2_hit = True
-                        pos.trailing_active = True
-                        pos.trailing_high = current_price  # actually trailing low
+    def _manage_long_position(
+        self,
+        position,
+        symbol,
+        price,
+    ):
+        coin = position.coin
 
-                if not pos.tp3_hit and pos.tp2_hit and current_price <= pos.tp3:
-                    pos.tp3_hit = True
-                    self._close_pump_position(coin, "TP3", current_price)
-                    continue
+        if not position.tp1_hit and price >= position.tp1:
+            qty = self._round_qty(
+                symbol,
+                position.original_quantity * 0.4,
+            )
 
-                if pos.trailing_active:
-                    if current_price < pos.trailing_high:
-                        pos.trailing_high = current_price
-                    trailing_sl = pos.trailing_high * (1 + PUMP_TRAILING_PCT)
-                    if current_price >= trailing_sl:
-                        self._close_pump_position(coin, "TRAILING STOP", current_price)
-                        continue
+            qty = min(qty, position.quantity)
 
-    def _partial_close(self, coin: str, symbol: str, qty: float, reason: str):
-        """Partially close a long position."""
-        try:
-            self.client.create_market_order(symbol, "sell", qty)
-            logger.info(f"PARTIAL CLOSE {coin} {reason}: sold {qty}")
-            self._alert(f"PUMP {coin} {reason}: partial close {qty}")
-        except Exception as e:
-            logger.error(f"Partial close failed for {coin}: {e}")
+            if qty > 0:
+                self.client.create_market_order(
+                    symbol,
+                    "sell",
+                    qty,
+                )
 
-    def _partial_close_short(self, coin: str, symbol: str, qty: float, reason: str):
-        """Partially close a short position."""
-        try:
-            self.client.create_market_order(symbol, "buy", qty)
-            logger.info(f"PARTIAL CLOSE SHORT {coin} {reason}: bought {qty}")
-            self._alert(f"DUMP SHORT {coin} {reason}: partial close {qty}")
-        except Exception as e:
-            logger.error(f"Partial close short failed for {coin}: {e}")
+                position.quantity -= qty
+                position.tp1_hit = True
+                position.stop_loss = position.entry_price * 1.002
 
-    def _close_pump_position(self, coin: str, reason: str, exit_price: float):
-        """Fully close a pump position."""
+                self._alert(
+                    f"🟡 <b>{coin} TP1</b>\n"
+                    f"Partial close: {qty}"
+                )
+
+        if (
+            position.tp1_hit
+            and not position.tp2_hit
+            and price >= position.tp2
+        ):
+            qty = self._round_qty(
+                symbol,
+                position.original_quantity * 0.3,
+            )
+
+            qty = min(qty, position.quantity)
+
+            if qty > 0:
+                self.client.create_market_order(
+                    symbol,
+                    "sell",
+                    qty,
+                )
+
+                position.quantity -= qty
+                position.tp2_hit = True
+                position.trailing_active = True
+                position.trailing_high = price
+
+                self._alert(
+                    f"🟠 <b>{coin} TP2</b>\n"
+                    f"Trailing stop activated"
+                )
+
+        if (
+            position.tp2_hit
+            and not position.tp3_hit
+            and price >= position.tp3
+        ):
+            position.tp3_hit = True
+
+            self._close_position(
+                coin,
+                price,
+                "TP3",
+            )
+            return
+
+        if position.trailing_active:
+            position.trailing_high = max(
+                position.trailing_high,
+                price,
+            )
+
+            trailing_stop = (
+                position.trailing_high
+                * (1 - PUMP_TRAILING_PCT)
+            )
+
+            if price <= trailing_stop:
+                self._close_position(
+                    coin,
+                    price,
+                    "TRAILING STOP",
+                )
+
+    def _manage_short_position(
+        self,
+        position,
+        symbol,
+        price,
+    ):
+        coin = position.coin
+
+        if not position.tp1_hit and price <= position.tp1:
+            qty = self._round_qty(
+                symbol,
+                position.original_quantity * 0.4,
+            )
+
+            qty = min(qty, position.quantity)
+
+            if qty > 0:
+                self.client.create_market_order(
+                    symbol,
+                    "buy",
+                    qty,
+                )
+
+                position.quantity -= qty
+                position.tp1_hit = True
+                position.stop_loss = position.entry_price * 0.998
+
+                self._alert(
+                    f"🟡 <b>{coin} SHORT TP1</b>\n"
+                    f"Partial close: {qty}"
+                )
+
+        if (
+            position.tp1_hit
+            and not position.tp2_hit
+            and price <= position.tp2
+        ):
+            qty = self._round_qty(
+                symbol,
+                position.original_quantity * 0.3,
+            )
+
+            qty = min(qty, position.quantity)
+
+            if qty > 0:
+                self.client.create_market_order(
+                    symbol,
+                    "buy",
+                    qty,
+                )
+
+                position.quantity -= qty
+                position.tp2_hit = True
+                position.trailing_active = True
+                position.trailing_high = price
+
+                self._alert(
+                    f"🟠 <b>{coin} SHORT TP2</b>\n"
+                    f"Trailing stop activated"
+                )
+
+        if (
+            position.tp2_hit
+            and not position.tp3_hit
+            and price <= position.tp3
+        ):
+            position.tp3_hit = True
+
+            self._close_position(
+                coin,
+                price,
+                "TP3",
+            )
+            return
+
+        if position.trailing_active:
+            position.trailing_high = min(
+                position.trailing_high,
+                price,
+            )
+
+            trailing_stop = (
+                position.trailing_high
+                * (1 + PUMP_TRAILING_PCT)
+            )
+
+            if price >= trailing_stop:
+                self._close_position(
+                    coin,
+                    price,
+                    "TRAILING STOP",
+                )
+
+    def _close_position(self, coin, exit_price, reason):
         with self._lock:
-            pos = self.pump_positions.get(coin)
-        if not pos:
+            position = self.pump_positions.get(coin)
+
+        if not position:
             return
 
         symbol = f"{coin}/USDT:USDT"
+
         try:
-            side = "sell" if pos.side == "long" else "buy"
-            remaining_qty = self._round_qty(symbol, pos.quantity)
-            if remaining_qty > 0:
-                self.client.create_market_order(symbol, side, remaining_qty)
+            side = (
+                "sell"
+                if position.side == "long"
+                else "buy"
+            )
 
-            # PnL includes leverage (notional = qty * price, leveraged)
-            if pos.side == "long":
-                pnl = (exit_price - pos.entry_price) * pos.quantity
+            quantity = self._round_qty(
+                symbol,
+                position.quantity,
+            )
+
+            if quantity > 0:
+                self.client.create_market_order(
+                    symbol,
+                    side,
+                    quantity,
+                )
+
+            if position.side == "long":
+                pnl = (
+                    exit_price - position.entry_price
+                ) * position.quantity
             else:
-                pnl = (pos.entry_price - exit_price) * pos.quantity
-            # Note: pnl is already correct since qty was sized with leverage factored in
+                pnl = (
+                    position.entry_price - exit_price
+                ) * position.quantity
 
-            pnl_pct = (exit_price / pos.entry_price - 1) * 100
-            if pos.side == "short":
+            pnl_pct = (
+                exit_price / position.entry_price - 1
+            ) * 100
+
+            if position.side == "short":
                 pnl_pct = -pnl_pct
 
-            self._daily_pump_pnl += pnl
-            duration = time.time() - pos.opened_at
+            duration = (
+                time.time() - position.opened_at
+            ) / 60
 
-            msg = (
-                f"PUMP CLOSED: {coin} ({pos.side}) | {reason}\n"
-                f"Entry: ${pos.entry_price:.4f} -> Exit: ${exit_price:.4f}\n"
-                f"PnL: ${pnl:.2f} ({pnl_pct:+.1f}%) | Duration: {duration/60:.0f}min\n"
-                f"Daily pump PnL: ${self._daily_pump_pnl:.2f}"
+            self._alert(
+                f"⚪ <b>POSITION CLOSED</b>\n\n"
+                f"🪙 {coin}\n"
+                f"Side: {position.side}\n"
+                f"Reason: {reason}\n"
+                f"Entry: <code>{self._format_price(position.entry_price)}</code>\n"
+                f"Exit: <code>{self._format_price(exit_price)}</code>\n"
+                f"PnL: <b>${pnl:.2f}</b> ({pnl_pct:+.2f}%)\n"
+                f"Duration: {duration:.1f} min"
             )
-            logger.info(msg)
-            self._alert(msg)
 
-            # Save trade to file for verification
-            try:
-                import json as _json
-                trade_record = {
-                    "coin": coin, "side": pos.side,
-                    "entry_price": pos.entry_price, "exit_price": exit_price,
-                    "quantity": pos.original_quantity, "pnl": round(pnl, 2),
-                    "pnl_pct": round(pnl_pct, 1), "reason": reason,
-                    "duration_min": round(duration / 60, 1),
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                pump_log_path = os.path.join(os.path.dirname(__file__), "pump_trades.json")
-                try:
-                    with open(pump_log_path, "r") as f:
-                        pump_log = _json.load(f)
-                except Exception:
-                    pump_log = []
-                pump_log.append(trade_record)
-                if len(pump_log) > 200:
-                    pump_log = pump_log[-200:]
-                with open(pump_log_path, "w") as f:
-                    _json.dump(pump_log, f, indent=2)
-            except Exception as _le:
-                logger.debug(f"Pump trade log save failed: {_le}")
+        except Exception as exc:
+            logger.exception(
+                "Failed to close %s: %s",
+                coin,
+                exc,
+            )
 
-        except Exception as e:
-            logger.error(f"Close pump position failed for {coin}: {e}")
+        finally:
+            with self._lock:
+                self.pump_positions.pop(coin, None)
+                self.cooldowns[coin] = (
+                    time.time() + PUMP_COOLDOWN_SEC
+                )
 
-        # Remove and set cooldown
-        with self._lock:
-            self.pump_positions.pop(coin, None)
-            self.cooldowns[coin] = time.time() + PUMP_COOLDOWN_SEC
-
-    # ═══════════════════════════════════════════════════════════════════
-    # D. NEW LISTING DETECTION
-    # ═══════════════════════════════════════════════════════════════════
-
-    def _check_new_listings(self):
-        """
-        Check Bybit announcements API for new perpetual listings.
-
-        Uses the official Bybit V5 API endpoint:
-        GET https://api.bybit.com/v5/announcements/index
-        """
-        try:
-            # Method 1: Official Bybit announcements API
-            url = "https://api.bybit.com/v5/announcements/index"
-            params = {
-                "locale": "en-US",
-                "type": "new_crypto",
-                "limit": 10,
-            }
-            resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("result", {}).get("list", [])
-                for item in items:
-                    title = item.get("title", "").upper()
-                    desc = item.get("description", "").upper()
-
-                    # Look for "USDT PERPETUAL" in announcement
-                    if "PERPETUAL" in title or "PERP" in title:
-                        # Extract coin symbol from title
-                        # Pattern: "Bybit Lists XXXUSDT Perpetual Contract"
-                        coin = self._extract_coin_from_listing(title)
-                        if coin and coin not in self.known_listings:
-                            self.known_listings.add(coin)
-                            logger.info(f"NEW LISTING DETECTED: {coin}")
-                            self._handle_new_listing(coin)
-
-            # Method 2: Check for new symbols in market data
-            self._check_new_symbols()
-
-        except Exception as e:
-            logger.error(f"Listing check failed: {e}")
-
-    def _extract_coin_from_listing(self, title: str) -> Optional[str]:
-        """Extract coin symbol from listing announcement title."""
-        # "Bybit Lists XYZUSDT Perpetual Contract"
-        import re
-        match = re.search(r'([A-Z0-9]{2,10})USDT', title)
-        if match:
-            return match.group(1)
-        return None
+    # ========================================================================
+    # NEW LISTINGS
+    # ========================================================================
 
     def _check_new_symbols(self):
-        """Check if any new USDT perp symbols appeared on the exchange."""
         try:
-            # Fix #7: Cache markets for MARKET_CACHE_TTL_SEC instead of reloading every cycle
             now = time.time()
-            if now - self._markets_last_loaded < MARKET_CACHE_TTL_SEC:
+
+            if now - self._markets_last_loaded < 300:
                 return
-            self.client.load_markets(True)  # force reload
+
+            self.client.load_markets(True)
             self._markets_last_loaded = now
 
-            current_symbols = set()
-            for sym, info in self.client.markets.items():
-                if (info.get("linear") and info.get("active") and
-                    info.get("quote") == "USDT" and info.get("type") == "swap"):
-                    current_symbols.add(sym)
+            current = set()
 
-            # Find new symbols
-            old_symbols = set(self._all_symbols)
-            new_symbols = current_symbols - old_symbols
+            for symbol, info in self.client.markets.items():
+                if (
+                    info.get("linear")
+                    and info.get("active")
+                    and info.get("quote") == "USDT"
+                    and info.get("type") == "swap"
+                ):
+                    current.add(symbol)
 
-            for sym in new_symbols:
-                coin = sym.split("/")[0]
-                if coin not in self.known_listings:
-                    self.known_listings.add(coin)
-                    logger.info(f"NEW SYMBOL DETECTED: {coin} ({sym})")
-                    self._handle_new_listing(coin)
+            old = set(self._all_symbols)
 
-            # Update symbol list
-            self._all_symbols = list(current_symbols)
+            new_symbols = current - old
 
-        except Exception as e:
-            logger.debug(f"Symbol check failed: {e}")
+            for symbol in new_symbols:
+                coin = symbol.split("/")[0]
 
+                if coin in self._blacklist:
+                    continue
 
-    def _check_binance_announcements(self):
-        """Check Binance for new listing announcements. If a coin lists on Binance, it often pumps on Bybit too."""
-        try:
-            import requests
-            url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
-            params = {"type": 1, "catalogId": 48, "pageNo": 1, "pageSize": 5}
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                articles = data.get("data", {}).get("catalogs", [{}])[0].get("articles", [])
-                for article in articles[:3]:
-                    title = article.get("title", "").upper()
-                    if "LIST" in title and ("PERPETUAL" in title or "FUTURES" in title):
-                        # Extract coin symbol from title
-                        import re
-                        match = re.search(r"\b([A-Z]{2,10})USDT\b", title)
-                        if match:
-                            coin = match.group(1)
-                            # Check if this coin exists on Bybit
-                            sym = f"{coin}/USDT:USDT"
-                            if sym in (self.client.markets or {}):
-                                if self._tg:
-                                    self._tg(f"BINANCE LISTING DETECTED: {coin} - also available on Bybit!")
-                                logger.info(f"[LISTING] Binance listed {coin}, available on Bybit")
-        except Exception as e:
-            logger.debug(f"Binance announcement check failed: {e}")
+                self._alert(
+                    f"🆕 <b>NEW BYBIT PERPETUAL</b>\n\n"
+                    f"🪙 <b>{coin}</b>\n"
+                    f"Pair: <code>{symbol}</code>\n"
+                    f"Mode: {PUMP_MODE.upper()}"
+                )
 
+            self._all_symbols = list(current)
 
-    def _handle_new_listing(self, coin: str):
-        """Handle a detected new listing (non-blocking, Fix #4)."""
-        # Skip blacklisted stock tokens
-        if coin in self._blacklist:
-            logger.info(f"Skipping blacklisted stock token: {coin}")
-            return
-        # Skip already-seen listings
-        if coin in self._seen_listings:
-            return
-        self._seen_listings.add(coin)
-        # Persist seen listings
-        try:
-            import json as _json
-            with open(self._seen_listings_file, "w") as f:
-                _json.dump(list(self._seen_listings), f)
-        except Exception:
-            pass
-        self._alert(f"NEW LISTING DETECTED: {coin} -- preparing to buy in {LISTING_BUY_DELAY_SEC}s")
-
-        # Fix #4: Set pending listing flag instead of blocking with sleep
-        self._pending_listing = {
-            "coin": coin,
-            "time": time.time() + LISTING_BUY_DELAY_SEC,
-        }
-
-    def _execute_listing_buy(self, coin: str):
-        """Execute the actual listing buy after the delay has passed (Fix #4)."""
-        symbol = f"{coin}/USDT:USDT"
-        try:
-            # Verify the pair exists and get current price
-            ticker = self.client.fetch_ticker(symbol)
-            price = float(ticker.get("last", 0))
-            if price <= 0:
-                logger.warning(f"No price for new listing {coin}")
-                return
-
-            signal = PumpSignal(
-                coin=coin,
-                signal_type="new_listing",
-                detected_at=time.time(),
-                price_at_detection=price,
-                volume_ratio=0,
-                rsi=50,
-                atr=price * 0.02,  # estimate ATR as 2% of price
-                confidence=0.7,
-                metadata={"source": "listing_detection"},
+        except Exception as exc:
+            logger.debug(
+                "New symbol check failed: %s",
+                exc,
             )
-            self._execute_signal(signal)
 
-        except Exception as e:
-            logger.error(f"Failed to trade new listing {coin}: {e}")
+    # ========================================================================
+    # TELEGRAM
+    # ========================================================================
 
-    # ═══════════════════════════════════════════════════════════════════
-    # TECHNICAL INDICATORS
-    # ═══════════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def _calc_rsi(closes: list[float], period: int = 14) -> float:
-        """Calculate RSI from a list of close prices."""
-        if len(closes) < period + 1:
-            return 50.0
-        deltas = np.diff(closes[-(period + 1):])
-        gains = np.where(deltas > 0, deltas, 0)
-        losses = np.where(deltas < 0, -deltas, 0)
-        avg_gain = np.mean(gains)
-        avg_loss = np.mean(losses)
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
-
-    @staticmethod
-    def _calc_atr(highs: list[float], lows: list[float],
-                  closes: list[float], period: int = 14) -> float:
-        """Calculate ATR from OHLC data."""
-        if len(highs) < period + 1:
-            return 0.0
-        trs = []
-        for i in range(-period, 0):
-            tr = max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i] - closes[i - 1]),
-            )
-            trs.append(tr)
-        return np.mean(trs)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # UTILITIES
-    # ═══════════════════════════════════════════════════════════════════
-
-    def _get_equity(self) -> float:
-        """Get account equity."""
-        try:
-            bal = self.client.fetch_balance({"type": "contract"})
-            return float(bal["total"].get("USDT", 0))
-        except Exception:
-            return 0.0
-
-    def _round_qty(self, symbol: str, qty: float) -> float:
-        """Round quantity to exchange-allowed precision."""
-        try:
-            market = self.client.market(symbol)
-            precision = market.get("precision", {}).get("amount", 8)
-            min_qty = market.get("limits", {}).get("amount", {}).get("min", 0)
-            qty = float(self.client.amount_to_precision(symbol, qty))
-            if qty < min_qty:
-                return 0.0
-            return qty
-        except Exception:
-            return round(qty, 4)
-
-    def _alert(self, message: str):
-        """Send Telegram alert."""
+    def _alert(self, message):
         if self.telegram_fn:
             try:
                 self.telegram_fn(message)
-            except Exception:
-                pass
-        elif PUMP_TELEGRAM_TOKEN and PUMP_TELEGRAM_CHAT_ID:
-            try:
-                url = f"https://api.telegram.org/bot{PUMP_TELEGRAM_TOKEN}/sendMessage"
-                requests.post(url, json={
-                    "chat_id": PUMP_TELEGRAM_CHAT_ID,
-                    "text": f"[PUMP SCANNER]\n{message}",
+            except Exception as exc:
+                logger.error(
+                    "Telegram callback failed: %s",
+                    exc,
+                )
+            return
+
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.warning(
+                "Telegram not configured"
+            )
+            return
+
+        try:
+            url = (
+                f"https://api.telegram.org/"
+                f"bot{TELEGRAM_TOKEN}/sendMessage"
+            )
+
+            response = requests.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
                     "parse_mode": "HTML",
-                }, timeout=5)
-            except Exception:
-                pass
+                    "disable_web_page_preview": True,
+                },
+                timeout=10,
+            )
 
-    # ═══════════════════════════════════════════════════════════════════
-    # STATUS / DEBUGGING
-    # ═══════════════════════════════════════════════════════════════════
+            if not response.ok:
+                logger.error(
+                    "Telegram error: %s",
+                    response.text[:500],
+                )
 
-    def get_status(self) -> dict:
-        """Return current scanner status for dashboard/monitoring."""
+        except Exception as exc:
+            logger.error(
+                "Telegram request failed: %s",
+                exc,
+            )
+
+    # ========================================================================
+    # UTILITIES
+    # ========================================================================
+
+    def _in_cooldown(self, coin):
+        with self._lock:
+            until = self.cooldowns.get(coin, 0)
+
+        return time.time() < until
+
+    def _get_equity(self):
+        try:
+            balance = self.client.fetch_balance(
+                {"type": "contract"}
+            )
+
+            return float(
+                balance["total"].get("USDT", 0)
+            )
+
+        except Exception as exc:
+            logger.error(
+                "Balance fetch failed: %s",
+                exc,
+            )
+            return 0.0
+
+    def _round_qty(self, symbol, quantity):
+        try:
+            market = self.client.market(symbol)
+
+            minimum = (
+                market.get("limits", {})
+                .get("amount", {})
+                .get("min", 0)
+                or 0
+            )
+
+            quantity = float(
+                self.client.amount_to_precision(
+                    symbol,
+                    quantity,
+                )
+            )
+
+            if quantity < minimum:
+                return 0.0
+
+            return quantity
+
+        except Exception:
+            return round(quantity, 4)
+
+    @staticmethod
+    def _format_price(price):
+        if price >= 1000:
+            return f"{price:,.2f}"
+
+        if price >= 1:
+            return f"{price:.4f}"
+
+        if price >= 0.01:
+            return f"{price:.6f}"
+
+        return f"{price:.8f}"
+
+    @staticmethod
+    def _pump_confidence(
+        volume_ratio,
+        price_change,
+        rsi,
+        buy_ratio,
+    ):
+        volume_score = min(
+            volume_ratio / (VOLUME_SPIKE_MULT * 2),
+            1.0,
+        )
+
+        price_score = min(
+            price_change / (PRICE_SPIKE_PCT * 3),
+            1.0,
+        )
+
+        rsi_score = max(
+            0,
+            1 - abs(rsi - 70) / 30,
+        )
+
+        buy_score = min(
+            buy_ratio / 0.8,
+            1.0,
+        )
+
+        return (
+            volume_score * 0.30
+            + price_score * 0.30
+            + rsi_score * 0.20
+            + buy_score * 0.20
+        )
+
+    @staticmethod
+    def _calc_rsi(closes, period=14):
+        if len(closes) < period + 1:
+            return 50.0
+
+        deltas = np.diff(
+            closes[-(period + 1):]
+        )
+
+        gains = np.where(
+            deltas > 0,
+            deltas,
+            0,
+        )
+
+        losses = np.where(
+            deltas < 0,
+            -deltas,
+            0,
+        )
+
+        avg_gain = np.mean(gains)
+        avg_loss = np.mean(losses)
+
+        if avg_loss == 0:
+            return 100.0
+
+        rs = avg_gain / avg_loss
+
+        return 100 - (
+            100 / (1 + rs)
+        )
+
+    @staticmethod
+    def _calc_atr(
+        highs,
+        lows,
+        closes,
+        period=14,
+    ):
+        if len(highs) < period + 1:
+            return 0.0
+
+        trs = []
+
+        for i in range(-period, 0):
+            tr = max(
+                highs[i] - lows[i],
+                abs(
+                    highs[i]
+                    - closes[i - 1]
+                ),
+                abs(
+                    lows[i]
+                    - closes[i - 1]
+                ),
+            )
+
+            trs.append(tr)
+
+        return float(np.mean(trs))
+
+    def get_status(self):
         with self._lock:
             return {
                 "running": self._running,
-                "symbols_monitored": len(self._all_symbols),
-                "active_pump_positions": len(self.pump_positions),
-                "positions": {
-                    coin: {
-                        "side": pos.side,
-                        "entry": pos.entry_price,
-                        "sl": pos.stop_loss,
-                        "tp1": pos.tp1,
-                        "tp2": pos.tp2,
-                        "trailing_active": pos.trailing_active,
-                        "trailing_high": pos.trailing_high,
-                    }
-                    for coin, pos in self.pump_positions.items()
-                },
-                "cooldowns_active": sum(1 for t in self.cooldowns.values() if t > time.time()),
-                "daily_pump_pnl": self._daily_pump_pnl,
-                "volume_baselines_loaded": len(self.volume_baselines),
+                "mode": PUMP_MODE,
+                "trading_enabled": TRADING_ENABLED,
+                "trading_allowed": self._trading_allowed(),
+                "symbols": len(self._all_symbols),
+                "positions": len(self.pump_positions),
+                "cooldowns": sum(
+                    1
+                    for value in self.cooldowns.values()
+                    if value > time.time()
+                ),
             }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# INTEGRATION HELPER — add to existing bot
-# ═══════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# FACTORY
+# ============================================================================
 
 def create_pump_scanner_from_config():
     """
-    Factory function to create a PumpScanner from environment config.
+    Create scanner according to PUMP_MODE.
 
-    Usage in pro_trader.py:
-        from pump_scanner import create_pump_scanner_from_config
-        scanner = create_pump_scanner_from_config()
-        if scanner:
-            scanner.start()
+    alerts:
+        Uses public Bybit API only.
+
+    trading:
+        Requires BYBIT_API_KEY + BYBIT_API_SECRET
+        and TRADING_ENABLED=true.
+
+    off:
+        Returns None.
     """
+
+    if PUMP_MODE == "off":
+        logger.info(
+            "PUMP_MODE=off — scanner disabled"
+        )
+        return None
+
     try:
         import ccxt
 
-        api_key = os.getenv("BYBIT_API_KEY", "")
-        api_secret = os.getenv("BYBIT_API_SECRET", "")
+        # ------------------------------------------------------------
+        # ALERTS MODE
+        # ------------------------------------------------------------
 
-        if not api_key or not api_secret:
-            logger.warning("Bybit credentials not set, pump scanner disabled")
-            return None
+        if PUMP_MODE == "alerts":
 
-        client = ccxt.bybit({
-            "apiKey": api_key,
-            "secret": api_secret,
-            "enableRateLimit": True,
-            "options": {"defaultType": "linear"},
-        })
-        testnet = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
-        if testnet:
+            logger.info(
+                "Creating PUBLIC Bybit client — alert mode"
+            )
+
+            client = ccxt.bybit({
+                "enableRateLimit": True,
+                "options": {
+                    "defaultType": "linear",
+                },
+            })
+
+        # ------------------------------------------------------------
+        # TRADING MODE
+        # ------------------------------------------------------------
+
+        elif PUMP_MODE == "trading":
+
+            if not TRADING_ENABLED:
+                logger.error(
+                    "PUMP_MODE=trading but "
+                    "TRADING_ENABLED=false. "
+                    "Trading disabled."
+                )
+
+                # Public scanner still works,
+                # but NO trading will happen.
+                client = ccxt.bybit({
+                    "enableRateLimit": True,
+                    "options": {
+                        "defaultType": "linear",
+                    },
+                })
+
+            elif not BYBIT_API_KEY or not BYBIT_API_SECRET:
+                raise RuntimeError(
+                    "PUMP_MODE=trading requires "
+                    "BYBIT_API_KEY and BYBIT_API_SECRET"
+                )
+
+            else:
+                logger.warning(
+                    "Creating AUTHENTICATED Bybit client — "
+                    "REAL TRADING ENABLED=%s",
+                    TRADING_ENABLED,
+                )
+
+                client = ccxt.bybit({
+                    "apiKey": BYBIT_API_KEY,
+                    "secret": BYBIT_API_SECRET,
+                    "enableRateLimit": True,
+                    "options": {
+                        "defaultType": "linear",
+                    },
+                })
+
+        else:
+            raise ValueError(
+                f"Unknown PUMP_MODE={PUMP_MODE}. "
+                f"Use off, alerts or trading."
+            )
+
+        if BYBIT_TESTNET:
             client.set_sandbox_mode(True)
+
         client.load_markets()
 
         scanner = PumpScanner(client)
+
         return scanner
 
-    except Exception as e:
-        logger.error(f"Failed to create pump scanner: {e}")
+    except Exception as exc:
+        logger.exception(
+            "Failed to create pump scanner: %s",
+            exc,
+        )
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STANDALONE MODE — run directly: python pump_scanner.py
-# ═══════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# STANDALONE
+# ============================================================================
 
 if __name__ == "__main__":
-    import dotenv
-    dotenv.load_dotenv()
+    from dotenv import load_dotenv
 
-    print("""
-    ╔═══════════════════════════════════════════╗
-    ║   DeepAlpha Pump Scanner                  ║
-    ║   Real-time pump detection on Bybit       ║
-    ║   https://deepalphabot.com                ║
-    ╚═══════════════════════════════════════════╝
-    """)
+    load_dotenv()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+    print(
+        """
+╔═══════════════════════════════════════════╗
+║       DeepAlpha Pump Scanner              ║
+║       Bybit PUMP / DUMP detection         ║
+╚═══════════════════════════════════════════╝
+"""
+    )
+
+    print(f"Mode: {PUMP_MODE}")
+    print(
+        f"Trading enabled: "
+        f"{TRADING_ENABLED}"
+    )
+    print(
+        f"Trading allowed: "
+        f"{PUMP_MODE == 'trading' and TRADING_ENABLED}"
+    )
 
     scanner = create_pump_scanner_from_config()
-    if scanner:
-        print(f"Pump Scanner initialized. Starting...")
-        scanner.start()
-        # Keep main thread alive
-        try:
-            while True:
-                time.sleep(60)
-        except KeyboardInterrupt:
-            print("\nShutting down...")
-            scanner.stop()
-    else:
-        print("Failed to initialize. Check your .env file:")
-        print("  BYBIT_API_KEY=your_key")
-        print("  BYBIT_API_SECRET=your_secret")
+
+    if not scanner:
+        print(
+            "Scanner is disabled or failed "
+            "to initialize."
+        )
+
+        raise SystemExit(1)
+
+    scanner.start()
+
+    if TEST_ALERT:
+        scanner._alert(
+            "🧪 <b>TEST ALERT</b>\n\n"
+            "Telegram connection works.\n"
+            f"Mode: <b>{PUMP_MODE.upper()}</b>\n"
+            f"Trading: <b>{'ON' if scanner._trading_allowed() else 'OFF'}</b>"
+        )
+
+    try:
+        while True:
+            time.sleep(60)
+
+    except KeyboardInterrupt:
+        print("Stopping scanner...")
+        scanner.stop()
