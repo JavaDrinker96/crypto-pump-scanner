@@ -1474,12 +1474,31 @@ def create_pump_scanner_from_config():
                 "Creating PUBLIC Bybit client — alert mode"
             )
 
-            client = ccxt.bybit({
-                "enableRateLimit": True,
-                "options": {
-                    "defaultType": "linear",
-                },
-            })
+            import os
+
+            USE_TOR_PROXY = os.getenv('USE_TOR_PROXY', 'true').lower() == 'true'
+
+            bybit_config = {
+                'enableRateLimit': True,
+            }
+
+            if USE_TOR_PROXY:
+                print("🔐 Используется Tor прокси (127.0.0.1:9050)")
+                bybit_config['proxies'] = {
+                    'http': 'socks5://127.0.0.1:9050',
+                    'https': 'socks5://127.0.0.1:9050',
+                }
+
+            try:
+                client = ccxt.bybit(bybit_config)
+                print("✅ Bybit клиент создан с Tor прокси")
+            except Exception as e:
+                if 'socks5' in str(e).lower() or 'proxy' in str(e).lower():
+                    print("⚠️  Tor недоступен, пытаемся без прокси...")
+                    bybit_config.pop('proxies', None)
+                    client = ccxt.bybit(bybit_config)
+                else:
+                    raise
 
         # ------------------------------------------------------------
         # TRADING MODE
@@ -1496,12 +1515,31 @@ def create_pump_scanner_from_config():
 
                 # Public scanner still works,
                 # but NO trading will happen.
-                client = ccxt.bybit({
-                    "enableRateLimit": True,
-                    "options": {
-                        "defaultType": "linear",
-                    },
-                })
+                import os
+                
+                USE_TOR_PROXY = os.getenv('USE_TOR_PROXY', 'true').lower() == 'true'
+                
+                bybit_config = {
+                    'enableRateLimit': True,
+                }
+                
+                if USE_TOR_PROXY:
+                    print("🔐 Используется Tor прокси (127.0.0.1:9050)")
+                    bybit_config['proxies'] = {
+                        'http': 'socks5://127.0.0.1:9050',
+                        'https': 'socks5://127.0.0.1:9050',
+                    }
+                
+                    try:
+                        client = ccxt.bybit(bybit_config)
+                        print("✅ Bybit клиент создан с Tor прокси")
+                    except Exception as e:
+                        if 'socks5' in str(e).lower() or 'proxy' in str(e).lower():
+                            print("⚠️  Tor недоступен, пытаемся без прокси...")
+                            bybit_config.pop('proxies', None)
+                            client = ccxt.bybit(bybit_config)
+                        else:
+                            raise
 
             elif not BYBIT_API_KEY or not BYBIT_API_SECRET:
                 raise RuntimeError(
