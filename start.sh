@@ -1,24 +1,15 @@
 #!/bin/bash
 
-# Запуск Tor в фоне
 echo "🔐 Запуск Tor прокси..."
-tor &
-TOR_PID=$!
 
-# Ждем инициализации Tor
-sleep 3
+# Запускаем Tor в фоне
+tor --hush &
 
-# Проверяем, что Tor запущен
-if ! ps -p $TOR_PID > /dev/null; then
-    echo "❌ Tor не запустился"
-    exit 1
-fi
+# Ждем инициализации Tor (5 секунд)
+sleep 5
 
-echo "✅ Tor прокси запущен (SOCKS5 127.0.0.1:9050)"
+echo "✅ Tor прокси запущен на SOCKS5 127.0.0.1:9050"
+echo "▶️  Запуск pump_scanner..."
 
 # Запускаем приложение
-python pump_scanner.py &
-APP_PID=$!
-
-# Ждем завершения приложения
-wait $APP_PID
+python pump_scanner.py
