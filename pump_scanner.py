@@ -1,34 +1,22 @@
 """
-DeepAlpha Pump Scanner
-======================
+DeepAlpha Pump Scanner - SIMPLE VERSION
+========================================
 
-Modes:
-    PUMP_MODE=off      -> scanner disabled
-    PUMP_MODE=alerts   -> market scanning + Telegram, NO trading
-    PUMP_MODE=trading  -> market scanning + Telegram + trading
-
-Required for alerts:
-    TELEGRAM_TOKEN
-    TELEGRAM_CHAT_ID
-
-Required for trading:
-    BYBIT_API_KEY
-    BYBIT_API_SECRET
-    TRADING_ENABLED=true
-
-Optional:
-    BYBIT_TESTNET=true
+Упрощённая версия:
+- Один TP
+- Один SL
+- TP/SL устанавливаются ПОСЛЕ фактического открытия позиции
+  через Bybit V5 /v5/position/trading-stop.
+- Защита от race-condition между signal price и LastPrice.
 """
 
 import json
 import logging
 import os
-import re
 import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -76,19 +64,16 @@ PUMP_LEVERAGE = int(os.getenv("PUMP_LEVERAGE", "5"))
 PUMP_RISK_BUDGET_PCT = float(os.getenv("PUMP_RISK_BUDGET_PCT", "0.05"))
 PUMP_MAX_POSITIONS = int(os.getenv("PUMP_MAX_POSITIONS", "2"))
 
+# One TP + one SL
+PUMP_TP_PCT = float(os.getenv("PUMP_TP_PCT", "0.05"))
 PUMP_SL_ATR_MULT = float(os.getenv("PUMP_SL_ATR_MULT", "1.5"))
-PUMP_TP1_PCT = float(os.getenv("PUMP_TP1_PCT", "0.05"))
-PUMP_TP2_PCT = float(os.getenv("PUMP_TP2_PCT", "0.10"))
-PUMP_TP3_PCT = float(os.getenv("PUMP_TP3_PCT", "0.20"))
-PUMP_TRAILING_PCT = float(os.getenv("PUMP_TRAILING_PCT", "0.03"))
 
 SHORT_SL_ATR_MULT = float(os.getenv("PUMP_SHORT_SL_ATR", "2.0"))
 SHORT_TP_PCT = float(os.getenv("PUMP_SHORT_TP_PCT", "0.05"))
 
 MIN_NOTIONAL = float(os.getenv("PUMP_MIN_NOTIONAL", "5"))
 
-# Liquidation safety. The scanner performs a conservative pre-entry estimate
-# and then reads Bybit's actual liquidation price after the fill.
+# Liquidation safety
 LIQ_SL_MIN_DISTANCE_PCT = float(
     os.getenv("PUMP_LIQ_SL_MIN_DISTANCE_PCT", "0.50")
 )
@@ -98,17 +83,38 @@ MAINTENANCE_MARGIN_RATE = float(
 LIQ_ESTIMATE_BUFFER_PCT = float(
     os.getenv("PUMP_LIQ_ESTIMATE_BUFFER_PCT", "0.25")
 )
+
 POSITION_SYNC_INTERVAL_SEC = float(
     os.getenv("PUMP_POSITION_SYNC_INTERVAL", "5")
 )
 
+# Signal cooldown
 PUMP_COOLDOWN_SEC = int(os.getenv("PUMP_COOLDOWN_SEC", "1800"))
 
-# New listings
+# New listing checks
 LISTING_CHECK_INTERVAL = int(os.getenv("PUMP_LISTING_CHECK", "60"))
 
-# Test
 TEST_ALERT = os.getenv("PUMP_TEST_ALERT", "true").lower() == "true"
+
+# ============================================================================
+# NEW: POST-ENTRY TP/SL PROTECTION
+# ============================================================================
+
+# Minimum distance used when an intended trigger has already been crossed
+# by LastPrice while the position was being opened.
+PUMP_TRIGGER_BUFFER_PCT = float(
+    os.getenv("PUMP_TRIGGER_BUFFER_PCT", "0.10")
+)
+
+# Number of attempts to install TP/SL after the market entry.
+PUMP_PROTECTION_RETRIES = int(
+    os.getenv("PUMP_PROTECTION_RETRIES", "4")
+)
+
+# Delay between protection attempts.
+PUMP_PROTECTION_RETRY_DELAY_SEC = float(
+    os.getenv("PUMP_PROTECTION_RETRY_DELAY_SEC", "0.20")
+)
 
 
 # ============================================================================
@@ -134,20 +140,12 @@ class PumpPosition:
     side: str
     entry_price: float
     quantity: float
-    original_quantity: float
     stop_loss: float
-    tp1: float
-    tp2: float
-    tp3: float
-    trailing_active: bool = False
-    trailing_high: float = 0.0
-    tp1_hit: bool = False
-    tp2_hit: bool = False
-    tp3_hit: bool = False
+    take_profit: float
     opened_at: float = 0.0
     liquidation_price: float = 0.0
-    order_ids: dict = field(default_factory=dict)
     last_sync_at: float = 0.0
+    closed: bool = False
 
 
 # ============================================================================
@@ -165,7 +163,6 @@ class PumpScanner:
         self._lock = threading.Lock()
 
         self._all_symbols = []
-
         self.price_history = defaultdict(list)
         self.volume_baselines = defaultdict(list)
 
@@ -174,7 +171,6 @@ class PumpScanner:
 
         self.known_listings = set()
         self._markets_last_loaded = 0
-
         self._last_signal_time = {}
 
         self._blacklist = {
@@ -184,8 +180,7 @@ class PumpScanner:
             "UBER", "SQ", "PYPL", "SHOP", "SNOW", "CRWD",
             "NET", "DDOG", "ZS", "BABA", "DIS", "BA", "JPM",
             "V", "MA", "WMT", "PFE", "KO", "PEP", "COST",
-            "CSCO", "ORCL", "CRM", "ABNB", "SNAP", "PINS",
-            "ROKU",
+            "CSCO", "ORCL", "CRM", "ABNB", "SNAP", "PINS", "ROKU",
         }
 
     # ========================================================================
@@ -203,13 +198,11 @@ class PumpScanner:
             raise RuntimeError("No Bybit USDT perpetual symbols found")
 
         self._running = True
-
         self._thread = threading.Thread(
             target=self._main_loop,
             daemon=True,
             name="PumpScanner",
         )
-
         self._thread.start()
 
         logger.info(
@@ -224,7 +217,8 @@ class PumpScanner:
             f"Mode: <b>{PUMP_MODE.upper()}</b>\n"
             f"Pairs: <b>{len(self._all_symbols)}</b>\n"
             f"Trading: <b>{'ON' if self._trading_allowed() else 'OFF'}</b>\n"
-            f"Testnet: <b>{'YES' if BYBIT_TESTNET else 'NO'}</b>"
+            f"Testnet: <b>{'YES' if BYBIT_TESTNET else 'NO'}</b>\n"
+            f"Style: <b>1 TP + 1 SL per position</b>"
         )
 
     def stop(self):
@@ -246,7 +240,10 @@ class PumpScanner:
             try:
                 loop_start = time.time()
 
-                if time.time() - listing_check_last >= LISTING_CHECK_INTERVAL:
+                if (
+                    time.time() - listing_check_last
+                    >= LISTING_CHECK_INTERVAL
+                ):
                     self._check_new_symbols()
                     listing_check_last = time.time()
 
@@ -268,7 +265,10 @@ class PumpScanner:
                 time.sleep(max(0.2, SCAN_INTERVAL_SEC - elapsed))
 
             except Exception as exc:
-                logger.exception("PumpScanner main loop error: %s", exc)
+                logger.exception(
+                    "PumpScanner main loop error: %s",
+                    exc,
+                )
                 time.sleep(5)
 
     # ========================================================================
@@ -279,7 +279,10 @@ class PumpScanner:
         try:
             markets = self.client.markets or self.client.load_markets()
         except Exception as exc:
-            logger.error("Failed to load Bybit markets: %s", exc)
+            logger.error(
+                "Failed to load Bybit markets: %s",
+                exc,
+            )
             return
 
         self._all_symbols = []
@@ -293,13 +296,19 @@ class PumpScanner:
             ):
                 self._all_symbols.append(symbol)
 
-        logger.info("Loaded %d USDT perpetuals", len(self._all_symbols))
+        logger.info(
+            "Loaded %d USDT perpetuals",
+            len(self._all_symbols),
+        )
 
     def _fetch_all_tickers(self):
         try:
             return self.client.fetch_tickers()
         except Exception as exc:
-            logger.error("Failed to fetch tickers: %s", exc)
+            logger.error(
+                "Failed to fetch tickers: %s",
+                exc,
+            )
             return {}
 
     def _fetch_ohlcv(self, symbol, limit=30):
@@ -310,7 +319,11 @@ class PumpScanner:
                 limit=limit,
             )
         except Exception as exc:
-            logger.debug("OHLCV failed for %s: %s", symbol, exc)
+            logger.debug(
+                "OHLCV failed for %s: %s",
+                symbol,
+                exc,
+            )
             return []
 
     # ========================================================================
@@ -319,7 +332,6 @@ class PumpScanner:
 
     def _scan_for_signals(self, tickers):
         signals = []
-        now = time.time()
 
         for symbol, ticker in tickers.items():
 
@@ -336,7 +348,9 @@ class PumpScanner:
 
             try:
                 price = float(ticker.get("last") or 0)
-                quote_volume = float(ticker.get("quoteVolume") or 0)
+                quote_volume = float(
+                    ticker.get("quoteVolume") or 0
+                )
 
                 if price <= 0 or quote_volume < MIN_DOLLAR_VOLUME:
                     continue
@@ -344,7 +358,9 @@ class PumpScanner:
                 self.price_history[coin].append(price)
 
                 if len(self.price_history[coin]) > 100:
-                    self.price_history[coin] = self.price_history[coin][-100:]
+                    self.price_history[coin] = (
+                        self.price_history[coin][-100:]
+                    )
 
                 prices = self.price_history[coin]
 
@@ -375,14 +391,15 @@ class PumpScanner:
                 ) / prices[-PRICE_WINDOW_CANDLES]
 
                 rsi = self._calc_rsi(closes)
-                atr = self._calc_atr(highs, lows, closes)
+                atr = self._calc_atr(
+                    highs,
+                    lows,
+                    closes,
+                )
 
                 self.volume_baselines[coin] = volumes
 
-                # ------------------------------------------------------------
                 # PUMP
-                # ------------------------------------------------------------
-
                 if (
                     volume_ratio >= VOLUME_SPIKE_MULT
                     and price_change >= PRICE_SPIKE_PCT
@@ -400,10 +417,7 @@ class PumpScanner:
                         signals.append(signal)
                         continue
 
-                # ------------------------------------------------------------
                 # DUMP
-                # ------------------------------------------------------------
-
                 if (
                     volume_ratio >= VOLUME_SPIKE_MULT * 0.5
                     and price_change <= -DUMP_PRICE_SPIKE_PCT
@@ -421,13 +435,13 @@ class PumpScanner:
                         signals.append(signal)
 
             except Exception as exc:
-                logger.debug("Scan error %s: %s", symbol, exc)
+                logger.debug(
+                    "Scan error %s: %s",
+                    symbol,
+                    exc,
+                )
 
         return signals
-
-    # ========================================================================
-    # PUMP VALIDATION
-    # ========================================================================
 
     def _validate_pump(
         self,
@@ -465,13 +479,16 @@ class PumpScanner:
         )
 
         total_volume = sum(volumes[-5:])
-
         buy_ratio = green_volume / max(total_volume, 1e-9)
 
         if buy_ratio < MIN_BUY_RATIO:
             return None
 
-        atr = self._calc_atr(highs, lows, closes)
+        atr = self._calc_atr(
+            highs,
+            lows,
+            closes,
+        )
 
         confidence = self._pump_confidence(
             volume_ratio,
@@ -499,10 +516,6 @@ class PumpScanner:
             },
         )
 
-    # ========================================================================
-    # DUMP VALIDATION
-    # ========================================================================
-
     def _validate_dump(
         self,
         coin,
@@ -521,8 +534,6 @@ class PumpScanner:
         rsi = self._calc_rsi(closes)
 
         if rsi > DUMP_MAX_RSI:
-            # A very high RSI means the move may still be pump/exhaustion,
-            # not a confirmed downside dump.
             return None
 
         red_volume = sum(
@@ -532,7 +543,6 @@ class PumpScanner:
         )
 
         total_volume = sum(volumes[-5:])
-
         sell_ratio = red_volume / max(total_volume, 1e-9)
 
         if sell_ratio < DUMP_MIN_SELL_RATIO:
@@ -547,14 +557,27 @@ class PumpScanner:
         if red_count < CONFIRM_CANDLES:
             return None
 
-        atr = self._calc_atr(highs, lows, closes)
+        atr = self._calc_atr(
+            highs,
+            lows,
+            closes,
+        )
 
-        volume_score = min(volume_ratio / (VOLUME_SPIKE_MULT * 2), 1.0)
-        price_score = min(
-            abs(price_change) / (DUMP_PRICE_SPIKE_PCT * 3),
+        volume_score = min(
+            volume_ratio / (VOLUME_SPIKE_MULT * 2),
             1.0,
         )
-        sell_score = min(sell_ratio / 0.8, 1.0)
+
+        price_score = min(
+            abs(price_change)
+            / (DUMP_PRICE_SPIKE_PCT * 3),
+            1.0,
+        )
+
+        sell_score = min(
+            sell_ratio / 0.8,
+            1.0,
+        )
 
         rsi_score = min(
             max((50 - rsi) / 30, 0),
@@ -594,18 +617,21 @@ class PumpScanner:
     def _process_signal(self, signal):
         coin = signal.coin
 
-        # Prevent repeated signals.
         last_time = self._last_signal_time.get(
             (coin, signal.signal_type),
             0,
         )
+
         if time.time() - last_time < PUMP_COOLDOWN_SEC:
             return
 
-        self._last_signal_time[(coin, signal.signal_type)] = time.time()
+        self._last_signal_time[
+            (coin, signal.signal_type)
+        ] = time.time()
 
         logger.info(
-            "%s detected: %s | price=%.8f | volume=%.1fx | RSI=%.1f | confidence=%.0f%%",
+            "%s detected: %s | price=%.8f | "
+            "volume=%.1fx | RSI=%.1f | confidence=%.0f%%",
             signal.signal_type.upper(),
             coin,
             signal.price_at_detection,
@@ -614,7 +640,6 @@ class PumpScanner:
             signal.confidence * 100,
         )
 
-        # Telegram always receives the signal first.
         self._send_signal_alert(signal)
 
         if not self._trading_allowed():
@@ -630,9 +655,11 @@ class PumpScanner:
         if success:
             return
 
-        # Every detected signal that did not become a trade gets an explicit
-        # Telegram message with the concrete rejection reason.
-        self._send_trade_skipped_alert(signal, reason, details)
+        self._send_trade_skipped_alert(
+            signal,
+            reason,
+            details,
+        )
 
     def _send_signal_alert(self, signal):
         coin = signal.coin
@@ -646,7 +673,11 @@ class PumpScanner:
             title = "DUMP DETECTED"
             direction = "DOWN"
 
-        price_change = signal.metadata.get("price_change", 0)
+        price_change = signal.metadata.get(
+            "price_change",
+            0,
+        )
+
         buy_ratio = signal.metadata.get("buy_ratio")
         sell_ratio = signal.metadata.get("sell_ratio")
 
@@ -654,7 +685,11 @@ class PumpScanner:
             f"{emoji} <b>{title}</b>",
             "",
             f"🪙 <b>{coin}</b>",
-            f"💰 Price: <code>{self._format_price(signal.price_at_detection)}</code>",
+            (
+                f"💰 Price: <code>"
+                f"{self._format_price(signal.price_at_detection)}"
+                f"</code>"
+            ),
             f"📈 Move: <b>{price_change:+.2%}</b>",
             f"📊 Volume: <b>{signal.volume_ratio:.1f}x</b>",
             f"📉 RSI: <b>{signal.rsi:.1f}</b>",
@@ -662,50 +697,74 @@ class PumpScanner:
         ]
 
         if buy_ratio is not None:
-            lines.append(f"🟢 Buy ratio: <b>{buy_ratio:.0%}</b>")
+            lines.append(
+                f"🟢 Buy ratio: <b>{buy_ratio:.0%}</b>"
+            )
 
         if sell_ratio is not None:
-            lines.append(f"🔴 Sell ratio: <b>{sell_ratio:.0%}</b>")
+            lines.append(
+                f"🔴 Sell ratio: <b>{sell_ratio:.0%}</b>"
+            )
 
-        lines.extend(
-            [
-                "",
-                f"Direction: <b>{direction}</b>",
-                f"Mode: <b>{PUMP_MODE.upper()}</b>",
-            ]
-        )
+        lines.extend([
+            "",
+            f"Direction: <b>{direction}</b>",
+            f"Mode: <b>{PUMP_MODE.upper()}</b>",
+        ])
 
         if not self._trading_allowed():
             lines.append("⚪ Trading: <b>OFF</b>")
 
         self._alert("\n".join(lines))
 
-    def _send_trade_skipped_alert(self, signal, reason, details=None):
+    def _send_trade_skipped_alert(
+        self,
+        signal,
+        reason,
+        details=None,
+    ):
         details = details or {}
+
         emoji = "🚫"
-        direction = "LONG" if signal.signal_type == "pump" else "SHORT"
+        direction = (
+            "LONG"
+            if signal.signal_type == "pump"
+            else "SHORT"
+        )
 
         lines = [
-            f"{emoji} <b>{signal.signal_type.upper()} — TRADE SKIPPED</b>",
+            (
+                f"{emoji} <b>"
+                f"{signal.signal_type.upper()} — TRADE SKIPPED"
+                f"</b>"
+            ),
             "",
             f"🪙 <b>{signal.coin}</b>",
             f"Direction: <b>{direction}</b>",
-            f"Price: <code>{self._format_price(signal.price_at_detection)}</code>",
+            (
+                f"Price: <code>"
+                f"{self._format_price(signal.price_at_detection)}"
+                f"</code>"
+            ),
             "",
             f"❌ <b>Reason:</b> {reason}",
         ]
 
         for label, value in details.items():
             if isinstance(value, float):
-                if "pct" in label.lower() or "distance" in label.lower():
+                if "pct" in label.lower():
                     rendered = f"{value:.3f}%"
                 else:
                     rendered = self._format_price(value)
             else:
                 rendered = str(value)
-            lines.append(f"{label}: <code>{rendered}</code>")
+
+            lines.append(
+                f"{label}: <code>{rendered}</code>"
+            )
 
         self._alert("\n".join(lines))
+
         logger.warning(
             "%s %s TRADE SKIPPED: %s | %s",
             signal.signal_type.upper(),
@@ -714,9 +773,9 @@ class PumpScanner:
             details,
         )
 
-    # ============================================================================
+    # ========================================================================
     # TRADING
-    # ============================================================================
+    # ========================================================================
 
     def _trading_allowed(self):
         return (
@@ -729,10 +788,16 @@ class PumpScanner:
     def _execute_signal(self, signal):
         with self._lock:
             if len(self.pump_positions) >= PUMP_MAX_POSITIONS:
-                return False, "maximum number of open pump positions reached", {
-                    "Open positions": len(self.pump_positions),
-                    "Maximum": PUMP_MAX_POSITIONS,
-                }
+                return (
+                    False,
+                    "maximum number of open positions reached",
+                    {
+                        "Open positions": len(
+                            self.pump_positions
+                        ),
+                        "Maximum": PUMP_MAX_POSITIONS,
+                    },
+                )
 
         coin = signal.coin
         symbol = f"{coin}/USDT:USDT"
@@ -746,20 +811,31 @@ class PumpScanner:
                 market = self.client.markets.get(symbol)
 
             if not market or not market.get("active"):
-                return False, "symbol is not tradable on Bybit", {
-                    "Symbol": symbol,
-                }
+                return (
+                    False,
+                    "symbol is not tradable on Bybit",
+                    {"Symbol": symbol},
+                )
 
             equity = self._get_equity()
+
             if equity <= 0:
-                return False, "USDT equity is zero or unavailable", {
-                    "Equity": equity,
-                }
+                return (
+                    False,
+                    "USDT equity is zero or unavailable",
+                    {"Equity": equity},
+                )
 
             if signal.signal_type == "pump":
-                return self._open_long(signal, equity)
+                return self._open_long(
+                    signal,
+                    equity,
+                )
 
-            return self._open_short(signal, equity)
+            return self._open_short(
+                signal,
+                equity,
+            )
 
         except Exception as exc:
             logger.exception(
@@ -767,14 +843,27 @@ class PumpScanner:
                 coin,
                 exc,
             )
-            return False, f"trade execution error: {exc}", {}
 
-    def _prepare_trade(self, signal, equity, side):
+            return (
+                False,
+                f"trade execution error: {exc}",
+                {},
+            )
+
+    def _prepare_trade(
+        self,
+        signal,
+        equity,
+        side,
+    ):
         symbol = f"{signal.coin}/USDT:USDT"
-        price = signal.price_at_detection
+        price = float(signal.price_at_detection)
 
         if side == "long":
-            risk_fraction = PUMP_RISK_BUDGET_PCT * signal.confidence
+            risk_fraction = (
+                PUMP_RISK_BUDGET_PCT
+                * signal.confidence
+            )
         else:
             risk_fraction = (
                 PUMP_RISK_BUDGET_PCT
@@ -782,127 +871,213 @@ class PumpScanner:
                 * 0.7
             )
 
-        notional = equity * risk_fraction * PUMP_LEVERAGE
-        quantity = self._round_qty(symbol, notional / price)
+        notional = (
+            equity
+            * risk_fraction
+            * PUMP_LEVERAGE
+        )
+
+        quantity = self._round_qty(
+            symbol,
+            notional / price,
+        )
 
         if quantity <= 0:
-            return None, (
-                "calculated quantity is below Bybit's minimum order size"
-            ), {
-                "Calculated notional": notional,
-                "Equity": equity,
-                "Minimum notional": MIN_NOTIONAL,
-            }
+            return (
+                None,
+                "calculated quantity is below minimum order size",
+                {
+                    "Calculated notional": notional,
+                    "Equity": equity,
+                    "Minimum notional": MIN_NOTIONAL,
+                },
+            )
 
-        # Recalculate from the rounded quantity. This avoids reporting a
-        # notional that differs from the actual order.
         actual_notional = quantity * price
 
         market = self.client.market(symbol)
+
         market_cost_min = (
             market.get("limits", {})
             .get("cost", {})
             .get("min", 0)
             or 0
         )
-        required_notional = max(MIN_NOTIONAL, float(market_cost_min or 0))
+
+        required_notional = max(
+            MIN_NOTIONAL,
+            float(market_cost_min or 0),
+        )
 
         if actual_notional < required_notional:
-            return None, "deposit/position size is too small for Bybit minimum order requirements", {
-                "Notional": actual_notional,
-                "Minimum notional": required_notional,
-                "Quantity": quantity,
-            }
+            return (
+                None,
+                "deposit/position size is too small",
+                {
+                    "Notional": actual_notional,
+                    "Minimum notional": required_notional,
+                    "Quantity": quantity,
+                },
+            )
 
         try:
-            self.client.set_leverage(PUMP_LEVERAGE, symbol)
+            self.client.set_leverage(
+                PUMP_LEVERAGE,
+                symbol,
+            )
         except Exception as exc:
-            logger.warning("set_leverage failed for %s: %s", symbol, exc)
+            # Bybit 110043 means leverage is already set.
+            message = str(exc)
 
-        return {
-            "symbol": symbol,
-            "quantity": quantity,
-            "notional": actual_notional,
-            "price": price,
-        }, None, None
+            if "110043" in message:
+                logger.info(
+                    "Leverage already set for %s: %sx",
+                    symbol,
+                    PUMP_LEVERAGE,
+                )
+            else:
+                logger.warning(
+                    "set_leverage failed for %s: %s",
+                    symbol,
+                    exc,
+                )
 
-    def _maintenance_margin_rate(self, symbol, notional):
-        """Return the best available maintenance-margin estimate.
+        return (
+            {
+                "symbol": symbol,
+                "quantity": quantity,
+                "notional": actual_notional,
+                "price": price,
+            },
+            None,
+            None,
+        )
 
-        CCXT/Bybit exposes leverage tiers on supported versions. The fallback
-        is intentionally configurable because maintenance margin varies by
-        symbol and risk tier.
-        """
+    # ========================================================================
+    # LIQUIDATION SAFETY
+    # ========================================================================
+
+    def _maintenance_margin_rate(
+        self,
+        symbol,
+        notional,
+    ):
         rate = MAINTENANCE_MARGIN_RATE
 
         try:
-            tiers = self.client.fetch_market_leverage_tiers(symbol)
+            tiers = self.client.fetch_market_leverage_tiers(
+                symbol
+            )
+
             if isinstance(tiers, list):
                 for tier in tiers:
-                    max_notional = tier.get("maxNotional")
-                    min_notional = tier.get("minNotional", 0) or 0
-                    mmr = (
-                        tier.get("maintenanceMarginRate")
-                        or tier.get("maintenanceMargin")
+                    max_notional = tier.get(
+                        "maxNotional"
                     )
+
+                    min_notional = (
+                        tier.get("minNotional", 0)
+                        or 0
+                    )
+
+                    mmr = (
+                        tier.get(
+                            "maintenanceMarginRate"
+                        )
+                        or tier.get(
+                            "maintenanceMargin"
+                        )
+                    )
+
                     if mmr is None:
                         continue
-                    if max_notional is None or (
-                        min_notional <= notional <= max_notional
+
+                    if (
+                        max_notional is None
+                        or (
+                            min_notional
+                            <= notional
+                            <= max_notional
+                        )
                     ):
                         rate = float(mmr)
                         break
+
         except Exception as exc:
             logger.debug(
-                "Could not fetch leverage tiers for %s: %s; using fallback MMR %.4f",
+                "Could not fetch leverage tiers for %s: %s",
                 symbol,
                 exc,
-                rate,
             )
 
         return max(rate, 0.0)
 
-    def _estimate_liquidation_price(self, entry_price, side, leverage, mmr):
-        """Conservative isolated-style liquidation estimate.
-
-        This is used BEFORE the order because a position that does not yet
-        exist has no Bybit liquidationPrice to fetch. Once filled, the actual
-        Bybit liquidationPrice is read from fetch_positions().
-        """
-        effective_mmr = mmr + (LIQ_ESTIMATE_BUFFER_PCT / 100.0)
+    def _estimate_liquidation_price(
+        self,
+        entry_price,
+        side,
+        leverage,
+        mmr,
+    ):
+        effective_mmr = (
+            mmr
+            + LIQ_ESTIMATE_BUFFER_PCT / 100.0
+        )
 
         if side == "long":
             return entry_price * (
-                1.0 - (1.0 / leverage) + effective_mmr
+                1.0
+                - (1.0 / leverage)
+                + effective_mmr
             )
 
         return entry_price * (
-            1.0 + (1.0 / leverage) - effective_mmr
+            1.0
+            + (1.0 / leverage)
+            - effective_mmr
         )
 
-    def _liq_sl_distance_pct(self, stop_loss, liquidation_price, side):
+    def _liq_sl_distance_pct(
+        self,
+        stop_loss,
+        liquidation_price,
+        side,
+    ):
         if side == "long":
             if liquidation_price >= stop_loss:
                 return -abs(
-                    (liquidation_price - stop_loss)
+                    (
+                        liquidation_price
+                        - stop_loss
+                    )
                     / max(stop_loss, 1e-12)
                     * 100
                 )
+
             return (
-                (stop_loss - liquidation_price)
+                (
+                    stop_loss
+                    - liquidation_price
+                )
                 / max(stop_loss, 1e-12)
                 * 100
             )
 
         if liquidation_price <= stop_loss:
             return -abs(
-                (stop_loss - liquidation_price)
+                (
+                    stop_loss
+                    - liquidation_price
+                )
                 / max(stop_loss, 1e-12)
                 * 100
             )
 
         return (
-            (liquidation_price - stop_loss)
+            (
+                liquidation_price
+                - stop_loss
+            )
             / max(stop_loss, 1e-12)
             * 100
         )
@@ -915,13 +1090,20 @@ class PumpScanner:
         side,
         notional,
     ):
-        mmr = self._maintenance_margin_rate(symbol, notional)
-        estimated_liq = self._estimate_liquidation_price(
-            entry_price,
-            side,
-            PUMP_LEVERAGE,
-            mmr,
+        mmr = self._maintenance_margin_rate(
+            symbol,
+            notional,
         )
+
+        estimated_liq = (
+            self._estimate_liquidation_price(
+                entry_price,
+                side,
+                PUMP_LEVERAGE,
+                mmr,
+            )
+        )
+
         distance = self._liq_sl_distance_pct(
             stop_loss,
             estimated_liq,
@@ -929,188 +1111,601 @@ class PumpScanner:
         )
 
         if distance < LIQ_SL_MIN_DISTANCE_PCT:
-            return False, {
+            return (
+                False,
+                {
+                    "Entry": entry_price,
+                    "SL": stop_loss,
+                    "Estimated liquidation": estimated_liq,
+                    "Liq→SL distance": distance,
+                    "Required distance": (
+                        LIQ_SL_MIN_DISTANCE_PCT
+                    ),
+                    "MMR used": mmr,
+                },
+            )
+
+        return (
+            True,
+            {
                 "Entry": entry_price,
                 "SL": stop_loss,
                 "Estimated liquidation": estimated_liq,
                 "Liq→SL distance": distance,
-                "Required distance": LIQ_SL_MIN_DISTANCE_PCT,
                 "MMR used": mmr,
-            }
+            },
+        )
 
-        return True, {
-            "Entry": entry_price,
-            "SL": stop_loss,
-            "Estimated liquidation": estimated_liq,
-            "Liq→SL distance": distance,
-            "MMR used": mmr,
-        }
+    # ========================================================================
+    # LIVE POSITION
+    # ========================================================================
 
-    def _fetch_live_position(self, symbol, expected_side=None):
+    def _fetch_live_position(
+        self,
+        symbol,
+        expected_side=None,
+    ):
         try:
-            positions = self.client.fetch_positions([symbol])
+            positions = self.client.fetch_positions(
+                [symbol]
+            )
         except Exception as exc:
-            logger.warning("fetch_positions failed for %s: %s", symbol, exc)
+            logger.warning(
+                "fetch_positions failed for %s: %s",
+                symbol,
+                exc,
+            )
             return None
 
         for pos in positions or []:
             contracts = pos.get("contracts")
+
             try:
-                contracts = abs(float(contracts or 0))
+                contracts = abs(
+                    float(contracts or 0)
+                )
             except (TypeError, ValueError):
                 contracts = 0
 
             if contracts <= 0:
                 continue
 
-            side = str(pos.get("side") or "").lower()
-            if expected_side and side and side != expected_side:
+            side = str(
+                pos.get("side") or ""
+            ).lower()
+
+            if (
+                expected_side
+                and side
+                and side != expected_side
+            ):
                 continue
 
-            entry = float(pos.get("entryPrice") or 0)
-            liq = float(pos.get("liquidationPrice") or 0)
+            entry = float(
+                pos.get("entryPrice") or 0
+            )
+
+            liq = float(
+                pos.get("liquidationPrice") or 0
+            )
 
             if entry > 0:
+                info = pos.get("info") or {}
+
+                position_idx = (
+                    info.get("positionIdx")
+                    or pos.get("positionIdx")
+                    or 0
+                )
+
+                try:
+                    position_idx = int(
+                        position_idx
+                    )
+                except (TypeError, ValueError):
+                    position_idx = 0
+
                 return {
                     "entry_price": entry,
                     "liquidation_price": liq,
                     "quantity": contracts,
                     "side": side,
+                    "position_idx": position_idx,
                     "raw": pos,
                 }
 
         return None
 
-    def _place_protective_orders(
+    # ========================================================================
+    # PRICE / PROTECTION HELPERS
+    # ========================================================================
+
+    def _fetch_last_price(self, symbol):
+        """
+        Fetch current LastPrice.
+
+        This is deliberately called AFTER the market entry.
+        """
+        ticker = self.client.fetch_ticker(symbol)
+
+        last = ticker.get("last")
+
+        if last is None:
+            last = ticker.get("close")
+
+        if last is None:
+            info = ticker.get("info") or {}
+            last = info.get("lastPrice")
+
+        if last is None:
+            raise RuntimeError(
+                f"Unable to determine LastPrice for {symbol}"
+            )
+
+        last = float(last)
+
+        if last <= 0:
+            raise RuntimeError(
+                f"Invalid LastPrice for {symbol}: {last}"
+            )
+
+        return last
+
+    def _format_exchange_price(
+        self,
+        symbol,
+        price,
+    ):
+        price = float(price)
+
+        if price <= 0:
+            raise ValueError(
+                f"Invalid price for {symbol}: {price}"
+            )
+
+        try:
+            return float(
+                self.client.price_to_precision(
+                    symbol,
+                    price,
+                )
+            )
+        except Exception:
+            return price
+
+    def _calculate_protection_prices(
         self,
         symbol,
         side,
-        quantity,
-        stop_loss,
-        tp1,
-        tp2,
-        tp3,
+        entry_price,
+        atr,
     ):
-        """Place all TP/SL orders on Bybit immediately after the fill.
-
-        These are exchange-side conditional market orders. The scanner never
-        sends a market order when TP1/TP2/TP3/SL is reached.
         """
-        close_side = "sell" if side == "long" else "buy"
-        trigger_direction = 1 if side == "long" else 2
+        Calculate TP/SL from REAL entry and make them valid
+        relative to the CURRENT LastPrice.
 
-        qty1 = self._round_qty(symbol, quantity * 0.40)
-        qty2 = self._round_qty(symbol, quantity * 0.30)
-        qty3 = self._round_qty(
-            symbol,
-            max(quantity - qty1 - qty2, 0),
+        LONG:
+            SL < LastPrice < TP
+
+        SHORT:
+            TP < LastPrice < SL
+        """
+        current_price = self._fetch_last_price(
+            symbol
         )
 
-        if min(qty1, qty2, qty3) <= 0:
-            raise RuntimeError(
-                "position quantity is too small to split into TP1/TP2/TP3"
+        entry_price = float(entry_price)
+        atr = float(atr or 0)
+
+        if entry_price <= 0:
+            raise ValueError(
+                f"Invalid entry price for {symbol}: "
+                f"{entry_price}"
             )
 
-        order_ids = {}
+        if atr <= 0:
+            atr = entry_price * 0.02
 
-        def create_trigger(label, trigger_price, qty):
-            order = self.client.create_order(
-                symbol,
-                "market",
-                close_side,
-                qty,
-                None,
-                {
-                    "triggerPrice": trigger_price,
-                    "triggerDirection": trigger_direction,
-                    "reduceOnly": True,
-                    "closeOnTrigger": True,
-                },
+        buffer_pct = max(
+            PUMP_TRIGGER_BUFFER_PCT,
+            0.0,
+        ) / 100.0
+
+        if side == "long":
+            stop_loss = (
+                entry_price
+                - atr * PUMP_SL_ATR_MULT
             )
-            order_id = order.get("id")
-            if not order_id:
-                raise RuntimeError(
-                    f"Bybit returned no order id for {label}"
+
+            take_profit = (
+                entry_price
+                * (1.0 + PUMP_TP_PCT)
+            )
+
+            # If price already crossed intended TP,
+            # place TP just above current LastPrice.
+            if take_profit <= current_price:
+                take_profit = (
+                    current_price
+                    * (1.0 + buffer_pct)
                 )
-            order_ids[label] = order_id
+
+            # Never submit an SL above current LastPrice.
+            if stop_loss >= current_price:
+                stop_loss = (
+                    current_price
+                    * (1.0 - buffer_pct)
+                )
+
+        elif side == "short":
+            stop_loss = (
+                entry_price
+                + atr * SHORT_SL_ATR_MULT
+            )
+
+            take_profit = (
+                entry_price
+                * (1.0 - SHORT_TP_PCT)
+            )
+
+            # If price already crossed intended TP,
+            # place TP just below current LastPrice.
+            if take_profit >= current_price:
+                take_profit = (
+                    current_price
+                    * (1.0 - buffer_pct)
+                )
+
+            # Never submit an SL below current LastPrice.
+            if stop_loss <= current_price:
+                stop_loss = (
+                    current_price
+                    * (1.0 + buffer_pct)
+                )
+
+        else:
+            raise ValueError(
+                f"Unknown position side: {side}"
+            )
+
+        stop_loss = self._format_exchange_price(
+            symbol,
+            stop_loss,
+        )
+
+        take_profit = self._format_exchange_price(
+            symbol,
+            take_profit,
+        )
+
+        current_price = self._format_exchange_price(
+            symbol,
+            current_price,
+        )
+
+        # Re-check after exchange precision rounding.
+        if side == "long":
+            if not (
+                stop_loss < current_price
+                and take_profit > current_price
+            ):
+                raise RuntimeError(
+                    "Invalid LONG protection after "
+                    "price rounding: "
+                    f"SL={stop_loss}, "
+                    f"LastPrice={current_price}, "
+                    f"TP={take_profit}"
+                )
+
+        else:
+            if not (
+                take_profit < current_price
+                and stop_loss > current_price
+            ):
+                raise RuntimeError(
+                    "Invalid SHORT protection after "
+                    "price rounding: "
+                    f"TP={take_profit}, "
+                    f"LastPrice={current_price}, "
+                    f"SL={stop_loss}"
+                )
+
+        return (
+            stop_loss,
+            take_profit,
+            current_price,
+        )
+
+    def _get_position_idx(self, live):
+        """
+        Return actual Bybit positionIdx.
+
+        0 = one-way mode
+        1 = hedge-mode Buy
+        2 = hedge-mode Sell
+        """
+        if not live:
+            return 0
+
+        position_idx = live.get(
+            "position_idx"
+        )
+
+        if position_idx is None:
+            raw = live.get("raw") or {}
+            info = raw.get("info") or {}
+
+            position_idx = (
+                info.get("positionIdx")
+                or raw.get("positionIdx")
+                or 0
+            )
 
         try:
-            # TP orders are exchange-side and independent.
-            create_trigger("tp1", tp1, qty1)
-            create_trigger("tp2", tp2, qty2)
-            create_trigger("tp3", tp3, qty3)
+            return int(position_idx)
+        except (TypeError, ValueError):
+            return 0
 
-            # SL closes whatever remains. closeOnTrigger makes it protective.
-            sl_order = self.client.create_order(
-                symbol,
-                "market",
-                close_side,
-                quantity,
-                None,
-                {
-                    "triggerPrice": stop_loss,
-                    "triggerDirection": 2 if side == "long" else 1,
-                    "reduceOnly": True,
-                    "closeOnTrigger": True,
-                },
+    def _set_position_protection(
+        self,
+        symbol,
+        side,
+        take_profit,
+        stop_loss,
+        live,
+    ):
+        """
+        Set FULL-POSITION TP/SL using Bybit V5
+        /v5/position/trading-stop.
+
+        TP/SL are installed only after the position exists.
+        """
+        market = self.client.market(symbol)
+        bybit_symbol = market["id"]
+
+        position_idx = self._get_position_idx(
+            live
+        )
+
+        params = {
+            "category": "linear",
+            "symbol": bybit_symbol,
+            "tpslMode": "Full",
+            "takeProfit": str(
+                self._format_exchange_price(
+                    symbol,
+                    take_profit,
+                )
+            ),
+            "stopLoss": str(
+                self._format_exchange_price(
+                    symbol,
+                    stop_loss,
+                )
+            ),
+            "tpTriggerBy": "LastPrice",
+            "slTriggerBy": "LastPrice",
+            "tpOrderType": "Market",
+            "slOrderType": "Market",
+            "positionIdx": position_idx,
+        }
+
+        method = getattr(
+            self.client,
+            "private_post_v5_position_trading_stop",
+            None,
+        )
+
+        if method is None:
+            raise RuntimeError(
+                "Installed CCXT does not expose "
+                "private_post_v5_position_trading_stop. "
+                "Update CCXT to a current version."
             )
 
-            if not sl_order.get("id"):
-                raise RuntimeError("Bybit returned no order id for stop loss")
+        logger.info(
+            "Setting %s TP/SL | %s | "
+            "SL=%.8f | TP=%.8f | positionIdx=%s",
+            side.upper(),
+            symbol,
+            stop_loss,
+            take_profit,
+            position_idx,
+        )
 
-            order_ids["sl"] = sl_order["id"]
-            return order_ids
+        return method(params)
 
-        except Exception:
-            # Never leave a partially-created TP/SL set behind if another
-            # protective order fails.
-            self._cancel_protective_orders(symbol, order_ids)
-            raise
+    def _protect_open_position(
+        self,
+        symbol,
+        side,
+        entry_price,
+        atr,
+        live,
+    ):
+        """
+        Install TP/SL with retries.
 
-    def _cancel_protective_orders(self, symbol, order_ids):
-        for label, order_id in (order_ids or {}).items():
+        Every attempt fetches a fresh LastPrice and recalculates
+        trigger prices, eliminating the stale-price race.
+        """
+        last_error = None
+
+        for attempt in range(
+            1,
+            PUMP_PROTECTION_RETRIES + 1,
+        ):
             try:
-                self.client.cancel_order(order_id, symbol)
-                logger.info(
-                    "Cancelled protective order %s (%s) for %s",
-                    label,
-                    order_id,
-                    symbol,
+                current_live = (
+                    self._fetch_live_position(
+                        symbol,
+                        side,
+                    )
+                    or live
                 )
+
+                if not current_live:
+                    raise RuntimeError(
+                        "Position disappeared before "
+                        "TP/SL could be installed"
+                    )
+
+                actual_entry = float(
+                    current_live["entry_price"]
+                )
+
+                (
+                    stop_loss,
+                    take_profit,
+                    current_price,
+                ) = self._calculate_protection_prices(
+                    symbol,
+                    side,
+                    actual_entry,
+                    atr,
+                )
+
+                actual_notional = (
+                    float(current_live["quantity"])
+                    * actual_entry
+                )
+
+                safe, liq_details = (
+                    self._check_liquidation_safety(
+                        symbol,
+                        actual_entry,
+                        stop_loss,
+                        side,
+                        actual_notional,
+                    )
+                )
+
+                if not safe:
+                    return (
+                        False,
+                        stop_loss,
+                        take_profit,
+                        current_price,
+                        "liquidation price too close to SL",
+                    )
+
+                self._set_position_protection(
+                    symbol,
+                    side,
+                    take_profit,
+                    stop_loss,
+                    current_live,
+                )
+
+                logger.info(
+                    "TP/SL SET %s | %s | attempt=%d | "
+                    "entry=%.8f LastPrice=%.8f "
+                    "SL=%.8f TP=%.8f",
+                    side.upper(),
+                    symbol,
+                    attempt,
+                    actual_entry,
+                    current_price,
+                    stop_loss,
+                    take_profit,
+                )
+
+                return (
+                    True,
+                    stop_loss,
+                    take_profit,
+                    current_price,
+                    None,
+                )
+
             except Exception as exc:
-                # Already-filled/cancelled orders are expected here.
-                logger.debug(
-                    "Could not cancel %s order %s for %s: %s",
-                    label,
-                    order_id,
+                last_error = exc
+
+                logger.warning(
+                    "TP/SL protection attempt %d/%d "
+                    "failed for %s: %s",
+                    attempt,
+                    PUMP_PROTECTION_RETRIES,
                     symbol,
                     exc,
                 )
 
-    def _open_long(self, signal, equity):
+                if attempt < PUMP_PROTECTION_RETRIES:
+                    time.sleep(
+                        PUMP_PROTECTION_RETRY_DELAY_SEC
+                    )
+
+        return (
+            False,
+            None,
+            None,
+            None,
+            str(last_error),
+        )
+
+    # ========================================================================
+    # OPEN LONG
+    # ========================================================================
+
+    def _open_long(
+        self,
+        signal,
+        equity,
+    ):
+        """
+        Open LONG first.
+
+        IMPORTANT:
+        The entry order contains NO TP/SL.
+
+        Flow:
+            market entry
+            -> actual position
+            -> actual entry price
+            -> fresh LastPrice
+            -> TP/SL
+            -> liquidation check
+            -> Bybit trading-stop
+            -> register local position
+        """
         coin = signal.coin
         symbol = f"{coin}/USDT:USDT"
 
-        atr = signal.atr or signal.price_at_detection * 0.02
-        estimated_entry = signal.price_at_detection
-        stop_loss = estimated_entry - atr * PUMP_SL_ATR_MULT
-        tp1 = estimated_entry * (1 + PUMP_TP1_PCT)
-        tp2 = estimated_entry * (1 + PUMP_TP2_PCT)
-        tp3 = estimated_entry * (1 + PUMP_TP3_PCT)
-
-        trade, reason, details = self._prepare_trade(
-            signal, equity, "long"
+        trade, reason, details = (
+            self._prepare_trade(
+                signal,
+                equity,
+                "long",
+            )
         )
+
         if not trade:
             return False, reason, details
 
-        safe, liq_details = self._check_liquidation_safety(
-            symbol,
-            estimated_entry,
-            stop_loss,
-            "long",
-            trade["notional"],
+        estimated_entry = float(
+            signal.price_at_detection
         )
+
+        atr = float(
+            signal.atr
+            or estimated_entry * 0.02
+        )
+
+        preliminary_sl = (
+            estimated_entry
+            - atr * PUMP_SL_ATR_MULT
+        )
+
+        safe, liq_details = (
+            self._check_liquidation_safety(
+                symbol,
+                estimated_entry,
+                preliminary_sl,
+                "long",
+                trade["notional"],
+            )
+        )
+
         if not safe:
             return (
                 False,
@@ -1118,87 +1713,115 @@ class PumpScanner:
                 liq_details,
             )
 
+        entry_created = False
+
         try:
+            # ================================================================
+            # STEP 1: MARKET ENTRY ONLY
+            # ================================================================
             order = self.client.create_market_order(
                 symbol,
                 "buy",
                 trade["quantity"],
             )
 
-            fill_price = float(
-                order.get("average")
-                or order.get("price")
-                or estimated_entry
+            entry_created = True
+
+            logger.info(
+                "LONG ENTRY SENT %s | qty=%s | order_id=%s",
+                coin,
+                trade["quantity"],
+                order.get("id"),
             )
 
-            # Prefer Bybit's actual filled entry and liquidation price.
-            live = self._fetch_live_position(symbol, "long")
-            if live:
-                fill_price = live["entry_price"]
-                actual_liq = live["liquidation_price"]
-            else:
-                actual_liq = 0.0
+            # ================================================================
+            # STEP 2: CONFIRM REAL POSITION
+            # ================================================================
+            live = None
 
-            atr = signal.atr or fill_price * 0.02
-            stop_loss = fill_price - atr * PUMP_SL_ATR_MULT
-            tp1 = fill_price * (1 + PUMP_TP1_PCT)
-            tp2 = fill_price * (1 + PUMP_TP2_PCT)
-            tp3 = fill_price * (1 + PUMP_TP3_PCT)
-
-            if actual_liq > 0:
-                actual_distance = self._liq_sl_distance_pct(
-                    stop_loss,
-                    actual_liq,
+            for _ in range(5):
+                live = self._fetch_live_position(
+                    symbol,
                     "long",
                 )
-                if actual_distance < LIQ_SL_MIN_DISTANCE_PCT:
-                    logger.error(
-                        "Actual Bybit liquidation is too close after long fill: "
-                        "%s distance=%.3f%% required=%.3f%%",
-                        coin,
-                        actual_distance,
-                        LIQ_SL_MIN_DISTANCE_PCT,
-                    )
-                    self._emergency_close_after_failed_protection(
-                        symbol,
-                        "sell",
-                        trade["quantity"],
-                    )
-                    return (
-                        False,
-                        "Bybit liquidation price after fill is too close to SL; position was immediately closed",
-                        {
-                            "Entry": fill_price,
-                            "SL": stop_loss,
-                            "Bybit liquidation": actual_liq,
-                            "Liq→SL distance": actual_distance,
-                            "Required distance": LIQ_SL_MIN_DISTANCE_PCT,
-                        },
-                    )
 
-            live_qty = live["quantity"] if live else trade["quantity"]
-            order_ids = self._place_protective_orders(
-                symbol,
-                "long",
-                live_qty,
-                stop_loss,
-                tp1,
-                tp2,
-                tp3,
+                if live:
+                    break
+
+                time.sleep(0.10)
+
+            if not live:
+                return (
+                    False,
+                    "market order executed but live position "
+                    "could not be confirmed",
+                    {},
+                )
+
+            fill_price = float(
+                live["entry_price"]
             )
 
+            live_qty = float(
+                live["quantity"]
+            )
+
+            actual_liq = float(
+                live["liquidation_price"]
+                or 0
+            )
+
+            # ================================================================
+            # STEP 3: INSTALL TP/SL
+            # ================================================================
+            (
+                protected,
+                stop_loss,
+                take_profit,
+                current_price,
+                protection_error,
+            ) = self._protect_open_position(
+                symbol,
+                "long",
+                fill_price,
+                atr,
+                live,
+            )
+
+            if not protected:
+                logger.error(
+                    "LONG protection FAILED %s: %s",
+                    coin,
+                    protection_error,
+                )
+
+                self._close_live_position_if_exists(
+                    symbol,
+                    "long",
+                )
+
+                return (
+                    False,
+                    "TP/SL protection failed; position closed",
+                    {
+                        "Entry": fill_price,
+                        "Protection error": (
+                            protection_error
+                        ),
+                    },
+                )
+
+            # ================================================================
+            # STEP 4: REGISTER ONLY AFTER PROTECTION EXISTS
+            # ================================================================
             position = PumpPosition(
                 coin=coin,
                 side="long",
                 entry_price=fill_price,
                 quantity=live_qty,
-                original_quantity=live_qty,
                 stop_loss=stop_loss,
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
+                take_profit=take_profit,
                 liquidation_price=actual_liq,
-                order_ids=order_ids,
                 opened_at=time.time(),
                 last_sync_at=time.time(),
             )
@@ -1207,77 +1830,118 @@ class PumpScanner:
                 self.pump_positions[coin] = position
 
             logger.info(
-                "PUMP LONG OPENED %s | entry=%.8f qty=%s liq=%.8f "
-                "SL=%.8f TP1=%.8f TP2=%.8f TP3=%.8f orders=%s",
+                "LONG OPENED %s | entry=%.8f qty=%s "
+                "liq=%.8f SL=%.8f TP=%.8f LastPrice=%.8f",
                 coin,
                 fill_price,
                 live_qty,
                 actual_liq,
                 stop_loss,
-                tp1,
-                tp2,
-                tp3,
-                order_ids,
+                take_profit,
+                current_price,
             )
 
             self._alert(
-                f"🟢 <b>PUMP LONG OPENED</b>\n\n"
+                "🟢 <b>LONG OPENED</b>\n\n"
                 f"🪙 {coin}\n"
-                f"Entry: <code>{self._format_price(fill_price)}</code>\n"
+                f"Entry: <code>"
+                f"{self._format_price(fill_price)}"
+                f"</code>\n"
                 f"Qty: <code>{live_qty}</code>\n"
-                f"Liquidation: <code>{self._format_price(actual_liq) if actual_liq else 'N/A'}</code>\n"
-                f"SL: <code>{self._format_price(stop_loss)}</code>\n"
-                f"TP1: <code>{self._format_price(tp1)}</code> — 40%\n"
-                f"TP2: <code>{self._format_price(tp2)}</code> — 30%\n"
-                f"TP3: <code>{self._format_price(tp3)}</code> — 30%\n"
+                f"SL: <code>"
+                f"{self._format_price(stop_loss)}"
+                f"</code>\n"
+                f"TP: <code>"
+                f"{self._format_price(take_profit)}"
+                f"</code>\n"
+                f"Last: <code>"
+                f"{self._format_price(current_price)}"
+                f"</code>\n"
                 f"Leverage: {PUMP_LEVERAGE}x\n"
-                f"🛡️ TP/SL: <b>Bybit exchange-side</b>"
+                "TP/SL: <b>Position protection</b>"
             )
 
             return True, None, None
 
         except Exception as exc:
-            logger.exception("Failed to open long %s: %s", coin, exc)
-            # If entry succeeded but protective orders failed, do not leave
-            # an unprotected position running.
-            try:
-                self._emergency_close_after_failed_protection(
-                    symbol,
-                    "sell",
-                    trade["quantity"],
-                )
-            except Exception:
-                logger.exception(
-                    "Emergency close also failed for %s",
-                    coin,
-                )
+            logger.exception(
+                "Failed to open long %s: %s",
+                coin,
+                exc,
+            )
 
-            return False, f"order/protection setup failed: {exc}", {}
+            # Only close if the entry was actually sent.
+            if entry_created:
+                try:
+                    self._close_live_position_if_exists(
+                        symbol,
+                        "long",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Emergency close failed for %s",
+                        coin,
+                    )
 
-    def _open_short(self, signal, equity):
+            return (
+                False,
+                f"order setup failed: {exc}",
+                {},
+            )
+
+    # ========================================================================
+    # OPEN SHORT
+    # ========================================================================
+
+    def _open_short(
+        self,
+        signal,
+        equity,
+    ):
+        """
+        Open SHORT first.
+
+        IMPORTANT:
+        The entry order contains NO TP/SL.
+        """
         coin = signal.coin
         symbol = f"{coin}/USDT:USDT"
 
-        atr = signal.atr or signal.price_at_detection * 0.02
-        estimated_entry = signal.price_at_detection
-        stop_loss = estimated_entry + atr * SHORT_SL_ATR_MULT
-        tp1 = estimated_entry * (1 - SHORT_TP_PCT * 0.5)
-        tp2 = estimated_entry * (1 - SHORT_TP_PCT)
-        tp3 = estimated_entry * (1 - SHORT_TP_PCT * 1.5)
-
-        trade, reason, details = self._prepare_trade(
-            signal, equity, "short"
+        trade, reason, details = (
+            self._prepare_trade(
+                signal,
+                equity,
+                "short",
+            )
         )
+
         if not trade:
             return False, reason, details
 
-        safe, liq_details = self._check_liquidation_safety(
-            symbol,
-            estimated_entry,
-            stop_loss,
-            "short",
-            trade["notional"],
+        estimated_entry = float(
+            signal.price_at_detection
         )
+
+        atr = float(
+            signal.atr
+            or estimated_entry * 0.02
+        )
+
+        preliminary_sl = (
+            estimated_entry
+            + atr * SHORT_SL_ATR_MULT
+        )
+
+        safe, liq_details = (
+            self._check_liquidation_safety(
+                symbol,
+                estimated_entry,
+                preliminary_sl,
+                "short",
+                trade["notional"],
+            )
+        )
+
         if not safe:
             return (
                 False,
@@ -1285,86 +1949,115 @@ class PumpScanner:
                 liq_details,
             )
 
+        entry_created = False
+
         try:
+            # ================================================================
+            # STEP 1: MARKET ENTRY ONLY
+            # ================================================================
             order = self.client.create_market_order(
                 symbol,
                 "sell",
                 trade["quantity"],
             )
 
-            fill_price = float(
-                order.get("average")
-                or order.get("price")
-                or estimated_entry
+            entry_created = True
+
+            logger.info(
+                "SHORT ENTRY SENT %s | qty=%s | order_id=%s",
+                coin,
+                trade["quantity"],
+                order.get("id"),
             )
 
-            live = self._fetch_live_position(symbol, "short")
-            if live:
-                fill_price = live["entry_price"]
-                actual_liq = live["liquidation_price"]
-            else:
-                actual_liq = 0.0
+            # ================================================================
+            # STEP 2: CONFIRM REAL POSITION
+            # ================================================================
+            live = None
 
-            atr = signal.atr or fill_price * 0.02
-            stop_loss = fill_price + atr * SHORT_SL_ATR_MULT
-            tp1 = fill_price * (1 - SHORT_TP_PCT * 0.5)
-            tp2 = fill_price * (1 - SHORT_TP_PCT)
-            tp3 = fill_price * (1 - SHORT_TP_PCT * 1.5)
-
-            if actual_liq > 0:
-                actual_distance = self._liq_sl_distance_pct(
-                    stop_loss,
-                    actual_liq,
+            for _ in range(5):
+                live = self._fetch_live_position(
+                    symbol,
                     "short",
                 )
-                if actual_distance < LIQ_SL_MIN_DISTANCE_PCT:
-                    logger.error(
-                        "Actual Bybit liquidation is too close after short fill: "
-                        "%s distance=%.3f%% required=%.3f%%",
-                        coin,
-                        actual_distance,
-                        LIQ_SL_MIN_DISTANCE_PCT,
-                    )
-                    self._emergency_close_after_failed_protection(
-                        symbol,
-                        "buy",
-                        trade["quantity"],
-                    )
-                    return (
-                        False,
-                        "Bybit liquidation price after fill is too close to SL; position was immediately closed",
-                        {
-                            "Entry": fill_price,
-                            "SL": stop_loss,
-                            "Bybit liquidation": actual_liq,
-                            "Liq→SL distance": actual_distance,
-                            "Required distance": LIQ_SL_MIN_DISTANCE_PCT,
-                        },
-                    )
 
-            live_qty = live["quantity"] if live else trade["quantity"]
-            order_ids = self._place_protective_orders(
-                symbol,
-                "short",
-                live_qty,
-                stop_loss,
-                tp1,
-                tp2,
-                tp3,
+                if live:
+                    break
+
+                time.sleep(0.10)
+
+            if not live:
+                return (
+                    False,
+                    "market order executed but live position "
+                    "could not be confirmed",
+                    {},
+                )
+
+            fill_price = float(
+                live["entry_price"]
             )
 
+            live_qty = float(
+                live["quantity"]
+            )
+
+            actual_liq = float(
+                live["liquidation_price"]
+                or 0
+            )
+
+            # ================================================================
+            # STEP 3: INSTALL TP/SL
+            # ================================================================
+            (
+                protected,
+                stop_loss,
+                take_profit,
+                current_price,
+                protection_error,
+            ) = self._protect_open_position(
+                symbol,
+                "short",
+                fill_price,
+                atr,
+                live,
+            )
+
+            if not protected:
+                logger.error(
+                    "SHORT protection FAILED %s: %s",
+                    coin,
+                    protection_error,
+                )
+
+                self._close_live_position_if_exists(
+                    symbol,
+                    "short",
+                )
+
+                return (
+                    False,
+                    "TP/SL protection failed; position closed",
+                    {
+                        "Entry": fill_price,
+                        "Protection error": (
+                            protection_error
+                        ),
+                    },
+                )
+
+            # ================================================================
+            # STEP 4: REGISTER ONLY AFTER PROTECTION EXISTS
+            # ================================================================
             position = PumpPosition(
                 coin=coin,
                 side="short",
                 entry_price=fill_price,
                 quantity=live_qty,
-                original_quantity=live_qty,
                 stop_loss=stop_loss,
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
+                take_profit=take_profit,
                 liquidation_price=actual_liq,
-                order_ids=order_ids,
                 opened_at=time.time(),
                 last_sync_at=time.time(),
             )
@@ -1373,334 +2066,231 @@ class PumpScanner:
                 self.pump_positions[coin] = position
 
             logger.info(
-                "DUMP SHORT OPENED %s | entry=%.8f qty=%s liq=%.8f "
-                "SL=%.8f TP1=%.8f TP2=%.8f TP3=%.8f orders=%s",
+                "SHORT OPENED %s | entry=%.8f qty=%s "
+                "liq=%.8f SL=%.8f TP=%.8f LastPrice=%.8f",
                 coin,
                 fill_price,
                 live_qty,
                 actual_liq,
                 stop_loss,
-                tp1,
-                tp2,
-                tp3,
-                order_ids,
+                take_profit,
+                current_price,
             )
 
             self._alert(
-                f"🔴 <b>DUMP SHORT OPENED</b>\n\n"
+                "🔴 <b>SHORT OPENED</b>\n\n"
                 f"🪙 {coin}\n"
-                f"Entry: <code>{self._format_price(fill_price)}</code>\n"
+                f"Entry: <code>"
+                f"{self._format_price(fill_price)}"
+                f"</code>\n"
                 f"Qty: <code>{live_qty}</code>\n"
-                f"Liquidation: <code>{self._format_price(actual_liq) if actual_liq else 'N/A'}</code>\n"
-                f"SL: <code>{self._format_price(stop_loss)}</code>\n"
-                f"TP1: <code>{self._format_price(tp1)}</code> — 40%\n"
-                f"TP2: <code>{self._format_price(tp2)}</code> — 30%\n"
-                f"TP3: <code>{self._format_price(tp3)}</code> — 30%\n"
+                f"SL: <code>"
+                f"{self._format_price(stop_loss)}"
+                f"</code>\n"
+                f"TP: <code>"
+                f"{self._format_price(take_profit)}"
+                f"</code>\n"
+                f"Last: <code>"
+                f"{self._format_price(current_price)}"
+                f"</code>\n"
                 f"Leverage: {PUMP_LEVERAGE}x\n"
-                f"🛡️ TP/SL: <b>Bybit exchange-side</b>"
+                "TP/SL: <b>Position protection</b>"
             )
 
             return True, None, None
 
         except Exception as exc:
-            logger.exception("Failed to open short %s: %s", coin, exc)
-            try:
-                self._emergency_close_after_failed_protection(
-                    symbol,
-                    "buy",
-                    trade["quantity"],
-                )
-            except Exception:
-                logger.exception(
-                    "Emergency close also failed for %s",
-                    coin,
-                )
+            logger.exception(
+                "Failed to open short %s: %s",
+                coin,
+                exc,
+            )
 
-            return False, f"order/protection setup failed: {exc}", {}
+            if entry_created:
+                try:
+                    self._close_live_position_if_exists(
+                        symbol,
+                        "short",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Emergency close failed for %s",
+                        coin,
+                    )
+
+            return (
+                False,
+                f"order setup failed: {exc}",
+                {},
+            )
+
+    # ========================================================================
+    # EMERGENCY CLOSE
+    # ========================================================================
+
+    def _close_live_position_if_exists(
+        self,
+        symbol,
+        side,
+    ):
+        """
+        Emergency close ONLY when a live position exists.
+
+        This prevents the old Bybit 110017:
+        "current position is zero"
+        """
+        live = self._fetch_live_position(
+            symbol,
+            side,
+        )
+
+        if not live:
+            logger.info(
+                "Emergency close skipped: no live %s "
+                "position for %s",
+                side,
+                symbol,
+            )
+            return False
+
+        close_side = (
+            "sell"
+            if side == "long"
+            else "buy"
+        )
+
+        quantity = self._round_qty(
+            symbol,
+            live["quantity"],
+        )
+
+        if quantity <= 0:
+            logger.warning(
+                "Emergency close quantity is zero for %s",
+                symbol,
+            )
+            return False
+
+        logger.error(
+            "Emergency closing %s %s | qty=%s",
+            side.upper(),
+            symbol,
+            quantity,
+        )
+
+        self.client.create_market_order(
+            symbol,
+            close_side,
+            quantity,
+            params={
+                "reduceOnly": True,
+            },
+        )
+
+        return True
 
     def _emergency_close_after_failed_protection(
         self,
         symbol,
         side,
-        quantity,
+        quantity=None,
     ):
-        qty = self._round_qty(symbol, quantity)
-        if qty > 0:
-            self.client.create_market_order(
-                symbol,
-                side,
-                qty,
-                params={"reduceOnly": True},
-            )
+        """
+        Backward-compatible wrapper.
+        """
+        return self._close_live_position_if_exists(
+            symbol,
+            side,
+        )
 
-    # ============================================================================
+    # ========================================================================
     # POSITION MANAGEMENT
-    # ============================================================================
+    # ========================================================================
 
     def _manage_positions(self, tickers):
-        """Monitor exchange-side orders/positions.
-
-        IMPORTANT: this method never executes TP1/TP2/TP3/SL. Those exits are
-        already placed on Bybit. Polling here is only for synchronization,
-        notifications and the existing maximum-lifetime safety exit.
-        """
+        """Manage open positions and detect exchange-side closes."""
         with self._lock:
-            positions = list(self.pump_positions.items())
+            positions = list(
+                self.pump_positions.items()
+            )
 
         for coin, position in positions:
             symbol = f"{coin}/USDT:USDT"
 
             try:
-                live = self._fetch_live_position(symbol, position.side)
+                live = self._fetch_live_position(
+                    symbol,
+                    position.side,
+                )
 
                 if live:
-                    position.quantity = live["quantity"]
+                    position.quantity = live[
+                        "quantity"
+                    ]
+
                     if live["entry_price"] > 0:
-                        position.entry_price = live["entry_price"]
+                        position.entry_price = live[
+                            "entry_price"
+                        ]
+
                     if live["liquidation_price"] > 0:
-                        position.liquidation_price = live["liquidation_price"]
+                        position.liquidation_price = live[
+                            "liquidation_price"
+                        ]
 
-                    self._sync_protective_order_notifications(
-                        position,
-                        symbol,
-                    )
-
-                    # Keep the actual Bybit liquidation price in logs.
                     if (
                         position.liquidation_price > 0
-                        and time.time() - position.last_sync_at
-                        >= POSITION_SYNC_INTERVAL_SEC
+                        and (
+                            time.time()
+                            - position.last_sync_at
+                            >= POSITION_SYNC_INTERVAL_SEC
+                        )
                     ):
                         logger.info(
-                            "%s position sync | side=%s qty=%s entry=%.8f liq=%.8f",
+                            "%s sync | side=%s qty=%s "
+                            "entry=%.8f liq=%.8f",
                             coin,
                             position.side,
                             position.quantity,
                             position.entry_price,
                             position.liquidation_price,
                         )
+
                         position.last_sync_at = time.time()
 
                 else:
-                    # Position disappeared. This normally means TP/SL/manual
-                    # close/liquidation happened on the exchange.
-                    self._sync_protective_order_notifications(
-                        position,
-                        symbol,
-                    )
-                    self._finalize_exchange_closed_position(
+                    logger.info(
+                        "%s position closed on exchange | "
+                        "entry=%.8f",
                         coin,
-                        position,
+                        position.entry_price,
                     )
-                    continue
 
-                ticker = tickers.get(symbol)
-                if not ticker:
-                    continue
-
-                current_price = float(ticker.get("last") or 0)
-                if current_price <= 0:
-                    continue
-
-                # Existing 2h time exit remains a deliberate bot action.
-                # TP/SL are NOT handled here.
-                if time.time() - position.opened_at > 7200:
-                    self._close_position(
-                        coin,
-                        current_price,
-                        "TIME EXIT",
+                    self._alert(
+                        "⚪ <b>POSITION CLOSED</b>\n\n"
+                        f"🪙 {coin}\n"
+                        f"Side: {position.side}\n"
+                        f"Entry: <code>"
+                        f"{self._format_price(position.entry_price)}"
+                        f"</code>\n"
+                        "Closed by: <b>Bybit (TP/SL)</b>"
                     )
+
+                    with self._lock:
+                        self.pump_positions.pop(
+                            coin,
+                            None,
+                        )
+                        self.cooldowns[coin] = (
+                            time.time()
+                            + PUMP_COOLDOWN_SEC
+                        )
 
             except Exception as exc:
                 logger.exception(
-                    "Position synchronization failed for %s: %s",
+                    "Position sync failed for %s: %s",
                     coin,
                     exc,
-                )
-
-    def _sync_protective_order_notifications(self, position, symbol):
-        """Report filled exchange-side TP/SL orders without executing them."""
-        for label, order_id in (position.order_ids or {}).items():
-            if label == "tp1" and position.tp1_hit:
-                continue
-            if label == "tp2" and position.tp2_hit:
-                continue
-            if label == "tp3" and position.tp3_hit:
-                continue
-
-            try:
-                order = self.client.fetch_order(order_id, symbol)
-            except Exception as exc:
-                logger.debug(
-                    "Could not fetch protective order %s for %s: %s",
-                    order_id,
-                    symbol,
-                    exc,
-                )
-                continue
-
-            status = str(order.get("status") or "").lower()
-            if status != "closed":
-                continue
-
-            if label == "tp1":
-                position.tp1_hit = True
-                self._alert(
-                    f"🟡 <b>{position.coin} TP1 FILLED</b>\n"
-                    f"Exchange: <b>Bybit</b>\n"
-                    f"Order: <code>{order_id}</code>"
-                )
-            elif label == "tp2":
-                position.tp2_hit = True
-                self._alert(
-                    f"🟠 <b>{position.coin} TP2 FILLED</b>\n"
-                    f"Exchange: <b>Bybit</b>\n"
-                    f"Order: <code>{order_id}</code>"
-                )
-            elif label == "tp3":
-                position.tp3_hit = True
-                self._alert(
-                    f"🟣 <b>{position.coin} TP3 FILLED</b>\n"
-                    f"Exchange: <b>Bybit</b>\n"
-                    f"Order: <code>{order_id}</code>"
-                )
-            elif label == "sl":
-                self._alert(
-                    f"🔴 <b>{position.coin} STOP LOSS FILLED</b>\n"
-                    f"Exchange: <b>Bybit</b>\n"
-                    f"Order: <code>{order_id}</code>"
-                )
-
-            logger.info(
-                "%s %s exchange order filled | order=%s",
-                position.coin,
-                label.upper(),
-                order_id,
-            )
-
-    def _finalize_exchange_closed_position(self, coin, position):
-        """Remove local state after an exchange-side close."""
-        reason = "EXCHANGE CLOSE"
-
-        if position.tp3_hit:
-            reason = "TP3"
-        elif position.tp2_hit and not position.tp3_hit:
-            reason = "TP/SL AFTER TP2"
-        elif position.tp1_hit:
-            reason = "TP/SL AFTER TP1"
-
-        logger.info(
-            "%s position closed on exchange | reason=%s entry=%.8f",
-            coin,
-            reason,
-            position.entry_price,
-        )
-
-        self._alert(
-            f"⚪ <b>POSITION CLOSED</b>\n\n"
-            f"🪙 {coin}\n"
-            f"Side: {position.side}\n"
-            f"Reason: <b>{reason}</b>\n"
-            f"Entry: <code>{self._format_price(position.entry_price)}</code>\n"
-            f"Liquidation: <code>{self._format_price(position.liquidation_price) if position.liquidation_price else 'N/A'}</code>\n"
-            f"Exit managed by: <b>Bybit</b>"
-        )
-
-        with self._lock:
-            self.pump_positions.pop(coin, None)
-            self.cooldowns[coin] = (
-                time.time() + PUMP_COOLDOWN_SEC
-            )
-
-    def _close_position(self, coin, exit_price, reason):
-        """Manual safety/time exit only.
-
-        Normal TP1/TP2/TP3/SL exits never reach this function.
-        """
-        with self._lock:
-            position = self.pump_positions.get(coin)
-
-        if not position:
-            return
-
-        symbol = f"{coin}/USDT:USDT"
-
-        try:
-            self._cancel_protective_orders(
-                symbol,
-                position.order_ids,
-            )
-
-            side = (
-                "sell"
-                if position.side == "long"
-                else "buy"
-            )
-
-            quantity = self._round_qty(
-                symbol,
-                position.quantity,
-            )
-
-            if quantity > 0:
-                self.client.create_market_order(
-                    symbol,
-                    side,
-                    quantity,
-                    params={"reduceOnly": True},
-                )
-
-            if position.side == "long":
-                pnl = (
-                    exit_price - position.entry_price
-                ) * position.quantity
-            else:
-                pnl = (
-                    position.entry_price - exit_price
-                ) * position.quantity
-
-            pnl_pct = (
-                exit_price / position.entry_price - 1
-            ) * 100
-
-            if position.side == "short":
-                pnl_pct = -pnl_pct
-
-            duration = (
-                time.time() - position.opened_at
-            ) / 60
-
-            self._alert(
-                f"⚪ <b>POSITION CLOSED</b>\n\n"
-                f"🪙 {coin}\n"
-                f"Side: {position.side}\n"
-                f"Reason: {reason}\n"
-                f"Entry: <code>{self._format_price(position.entry_price)}</code>\n"
-                f"Exit: <code>{self._format_price(exit_price)}</code>\n"
-                f"PnL: <b>${pnl:.2f}</b> ({pnl_pct:+.2f}%)\n"
-                f"Duration: {duration:.1f} min"
-            )
-
-            logger.info(
-                "%s position manually closed | reason=%s exit=%.8f pnl=%.2f",
-                coin,
-                reason,
-                exit_price,
-                pnl,
-            )
-
-        except Exception as exc:
-            logger.exception(
-                "Failed to close %s: %s",
-                coin,
-                exc,
-            )
-
-        finally:
-            with self._lock:
-                self.pump_positions.pop(coin, None)
-                self.cooldowns[coin] = (
-                    time.time() + PUMP_COOLDOWN_SEC
                 )
 
     # ========================================================================
@@ -1711,7 +2301,10 @@ class PumpScanner:
         try:
             now = time.time()
 
-            if now - self._markets_last_loaded < 300:
+            if (
+                now - self._markets_last_loaded
+                < 300
+            ):
                 return
 
             self.client.load_markets(True)
@@ -1729,7 +2322,6 @@ class PumpScanner:
                     current.add(symbol)
 
             old = set(self._all_symbols)
-
             new_symbols = current - old
 
             for symbol in new_symbols:
@@ -1739,10 +2331,9 @@ class PumpScanner:
                     continue
 
                 self._alert(
-                    f"🆕 <b>NEW BYBIT PERPETUAL</b>\n\n"
+                    "🆕 <b>NEW LISTING</b>\n\n"
                     f"🪙 <b>{coin}</b>\n"
-                    f"Pair: <code>{symbol}</code>\n"
-                    f"Mode: {PUMP_MODE.upper()}"
+                    f"Pair: <code>{symbol}</code>"
                 )
 
             self._all_symbols = list(current)
@@ -1776,7 +2367,7 @@ class PumpScanner:
 
         try:
             url = (
-                f"https://api.telegram.org/"
+                "https://api.telegram.org/"
                 f"bot{TELEGRAM_TOKEN}/sendMessage"
             )
 
@@ -1809,7 +2400,10 @@ class PumpScanner:
 
     def _in_cooldown(self, coin):
         with self._lock:
-            until = self.cooldowns.get(coin, 0)
+            until = self.cooldowns.get(
+                coin,
+                0,
+            )
 
         return time.time() < until
 
@@ -1820,7 +2414,10 @@ class PumpScanner:
             )
 
             return float(
-                balance["total"].get("USDT", 0)
+                balance["total"].get(
+                    "USDT",
+                    0,
+                )
             )
 
         except Exception as exc:
@@ -1830,9 +2427,15 @@ class PumpScanner:
             )
             return 0.0
 
-    def _round_qty(self, symbol, quantity):
+    def _round_qty(
+        self,
+        symbol,
+        quantity,
+    ):
         try:
-            market = self.client.market(symbol)
+            market = self.client.market(
+                symbol
+            )
 
             minimum = (
                 market.get("limits", {})
@@ -1854,7 +2457,10 @@ class PumpScanner:
             return quantity
 
         except Exception:
-            return round(quantity, 4)
+            return round(
+                float(quantity),
+                4,
+            )
 
     @staticmethod
     def _format_price(price):
@@ -1877,12 +2483,14 @@ class PumpScanner:
         buy_ratio,
     ):
         volume_score = min(
-            volume_ratio / (VOLUME_SPIKE_MULT * 2),
+            volume_ratio
+            / (VOLUME_SPIKE_MULT * 2),
             1.0,
         )
 
         price_score = min(
-            price_change / (PRICE_SPIKE_PCT * 3),
+            price_change
+            / (PRICE_SPIKE_PCT * 3),
             1.0,
         )
 
@@ -1904,7 +2512,10 @@ class PumpScanner:
         )
 
     @staticmethod
-    def _calc_rsi(closes, period=14):
+    def _calc_rsi(
+        closes,
+        period=14,
+    ):
         if len(closes) < period + 1:
             return 50.0
 
@@ -1963,7 +2574,9 @@ class PumpScanner:
 
             trs.append(tr)
 
-        return float(np.mean(trs))
+        return float(
+            np.mean(trs)
+        )
 
     def get_status(self):
         with self._lock:
@@ -1971,12 +2584,19 @@ class PumpScanner:
                 "running": self._running,
                 "mode": PUMP_MODE,
                 "trading_enabled": TRADING_ENABLED,
-                "trading_allowed": self._trading_allowed(),
-                "symbols": len(self._all_symbols),
-                "positions": len(self.pump_positions),
+                "trading_allowed": (
+                    self._trading_allowed()
+                ),
+                "symbols": len(
+                    self._all_symbols
+                ),
+                "positions": len(
+                    self.pump_positions
+                ),
                 "cooldowns": sum(
                     1
-                    for value in self.cooldowns.values()
+                    for value
+                    in self.cooldowns.values()
                     if value > time.time()
                 ),
             }
@@ -1987,19 +2607,7 @@ class PumpScanner:
 # ============================================================================
 
 def create_pump_scanner_from_config():
-    """
-    Create scanner according to PUMP_MODE.
-
-    alerts:
-        Uses public Bybit API only.
-
-    trading:
-        Requires BYBIT_API_KEY + BYBIT_API_SECRET
-        and TRADING_ENABLED=true.
-
-    off:
-        Returns None.
-    """
+    """Create scanner according to PUMP_MODE."""
 
     if PUMP_MODE == "off":
         logger.info(
@@ -2010,84 +2618,31 @@ def create_pump_scanner_from_config():
     try:
         import ccxt
 
-        # ------------------------------------------------------------
-        # ALERTS MODE
-        # ------------------------------------------------------------
-
         if PUMP_MODE == "alerts":
-
             logger.info(
-                "Creating PUBLIC Bybit client — alert mode"
+                "Creating PUBLIC Bybit client"
             )
 
-            import os
-
-            USE_TOR_PROXY = os.getenv('USE_TOR_PROXY', 'true').lower() == 'true'
-
-            bybit_config = {
-                'enableRateLimit': True,
-            }
-
-            if USE_TOR_PROXY:
-                print("🔐 Используется Tor прокси (127.0.0.1:9050)")
-                bybit_config['proxies'] = {
-                    'http': 'socks5://127.0.0.1:9050',
-                    'https': 'socks5://127.0.0.1:9050',
-                }
-
-            try:
-                client = ccxt.bybit(bybit_config)
-                print("✅ Bybit клиент создан с Tor прокси")
-            except Exception as e:
-                if 'socks5' in str(e).lower() or 'proxy' in str(e).lower():
-                    print("⚠️  Tor недоступен, пытаемся без прокси...")
-                    bybit_config.pop('proxies', None)
-                    client = ccxt.bybit(bybit_config)
-                else:
-                    raise
-
-        # ------------------------------------------------------------
-        # TRADING MODE
-        # ------------------------------------------------------------
+            client = ccxt.bybit({
+                "enableRateLimit": True,
+            })
 
         elif PUMP_MODE == "trading":
 
             if not TRADING_ENABLED:
                 logger.error(
                     "PUMP_MODE=trading but "
-                    "TRADING_ENABLED=false. "
-                    "Trading disabled."
+                    "TRADING_ENABLED=false"
                 )
 
-                # Public scanner still works,
-                # but NO trading will happen.
-                import os
-                
-                USE_TOR_PROXY = os.getenv('USE_TOR_PROXY', 'true').lower() == 'true'
-                
-                bybit_config = {
-                    'enableRateLimit': True,
-                }
-                
-                if USE_TOR_PROXY:
-                    print("🔐 Используется Tor прокси (127.0.0.1:9050)")
-                    bybit_config['proxies'] = {
-                        'http': 'socks5://127.0.0.1:9050',
-                        'https': 'socks5://127.0.0.1:9050',
-                    }
-                
-                    try:
-                        client = ccxt.bybit(bybit_config)
-                        print("✅ Bybit клиент создан с Tor прокси")
-                    except Exception as e:
-                        if 'socks5' in str(e).lower() or 'proxy' in str(e).lower():
-                            print("⚠️  Tor недоступен, пытаемся без прокси...")
-                            bybit_config.pop('proxies', None)
-                            client = ccxt.bybit(bybit_config)
-                        else:
-                            raise
+                client = ccxt.bybit({
+                    "enableRateLimit": True,
+                })
 
-            elif not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            elif (
+                not BYBIT_API_KEY
+                or not BYBIT_API_SECRET
+            ):
                 raise RuntimeError(
                     "PUMP_MODE=trading requires "
                     "BYBIT_API_KEY and BYBIT_API_SECRET"
@@ -2095,8 +2650,8 @@ def create_pump_scanner_from_config():
 
             else:
                 logger.warning(
-                    "Creating AUTHENTICATED Bybit client — "
-                    "REAL TRADING ENABLED=%s",
+                    "Creating AUTHENTICATED Bybit client "
+                    "— TRADING ENABLED=%s",
                     TRADING_ENABLED,
                 )
 
@@ -2111,8 +2666,7 @@ def create_pump_scanner_from_config():
 
         else:
             raise ValueError(
-                f"Unknown PUMP_MODE={PUMP_MODE}. "
-                f"Use off, alerts or trading."
+                f"Unknown PUMP_MODE={PUMP_MODE}"
             )
 
         if BYBIT_TESTNET:
@@ -2143,36 +2697,35 @@ if __name__ == "__main__":
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        format=(
+            "%(asctime)s | %(levelname)s | "
+            "%(name)s | %(message)s"
+        ),
     )
 
     print(
         """
 ╔═══════════════════════════════════════════╗
-║       DeepAlpha Pump Scanner              ║
-║       Bybit PUMP / DUMP detection         ║
+║  DeepAlpha Pump Scanner (SIMPLIFIED)      ║
+║  1 TP + 1 SL per Position                 ║
 ╚═══════════════════════════════════════════╝
 """
     )
 
     print(f"Mode: {PUMP_MODE}")
     print(
-        f"Trading enabled: "
-        f"{TRADING_ENABLED}"
-    )
-    print(
-        f"Trading allowed: "
-        f"{PUMP_MODE == 'trading' and TRADING_ENABLED}"
+        f"Trading enabled: {TRADING_ENABLED}"
     )
 
-    scanner = create_pump_scanner_from_config()
+    scanner = (
+        create_pump_scanner_from_config()
+    )
 
     if not scanner:
         print(
             "Scanner is disabled or failed "
             "to initialize."
         )
-
         raise SystemExit(1)
 
     scanner.start()
@@ -2182,7 +2735,7 @@ if __name__ == "__main__":
             "🧪 <b>TEST ALERT</b>\n\n"
             "Telegram connection works.\n"
             f"Mode: <b>{PUMP_MODE.upper()}</b>\n"
-            f"Trading: <b>{'ON' if scanner._trading_allowed() else 'OFF'}</b>"
+            "Style: <b>1 TP + 1 SL per position</b>"
         )
 
     try:
