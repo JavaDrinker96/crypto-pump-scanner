@@ -14,14 +14,15 @@ class Position:
  symbol:str; side:str; entry:float; qty:float; stop:float; tp1:float; tp2:float; tp3:float; risk:float; remaining:float=1.; tp1_done:bool=False; tp2_done:bool=False
 class Engine:
  def __init__(self,client,alert=None):
-  self.c=client;self.alert=alert;self.pos={};self.realized=0.;self.losses=0;self.halted=False;self.day=time.strftime('%Y-%m-%d',time.gmtime());self.day_start=None
+  self.c=client;self.alert=alert;self.pos={};self.realized=0.;self.losses=0;self.halted=False;self.day=time.strftime('%Y-%m-%d',time.gmtime());self.day_start=None;self.pending={}
   self.vol=F('PUMP_VOL_SPIKE_MULT',3);self.minvol=F('PUMP_MIN_DOLLAR_VOL',5e6);self.m1=F('PUMP_MIN_1M_MOVE_PCT',.006);self.m3=F('PUMP_MIN_3M_MOVE_PCT',.012);self.m5=F('PUMP_MAX_5M_MOVE_PCT',.045);self.brk=I('PUMP_BREAKOUT_LOOKBACK',10)
   self.rmin=F('PUMP_MIN_RSI_ENTRY',52);self.rmax=F('PUMP_MAX_RSI_ENTRY',78);self.flowmin=F('PUMP_MIN_BUY_RATIO',.58);self.bookmin=F('PUMP_MIN_BOOK_IMBALANCE',.56);self.spread=F('MAX_SPREAD_PCT',.15);self.depth=F('ORDERBOOK_DEPTH_PCT',1)
   self.risk=F('MAX_RISK_PER_TRADE_PCT',.5)/100;self.dayloss=F('MAX_DAILY_LOSS_PCT',2)/100;self.maxloss=I('MAX_CONSECUTIVE_LOSSES',3);self.maxpos=I('PUMP_MAX_POSITIONS',2);self.lev=I('PUMP_LEVERAGE',2)
   self.tp1=F('TP1_R',1);self.tp2=F('TP2_R',2);self.tp3=F('TP3_R',3.5);self.tq1=F('TP1_CLOSE_PCT',.35);self.tq2=F('TP2_CLOSE_PCT',.35);self.trail=F('TRAILING_ATR_MULT',1.5);self.sl=F('PUMP_SL_ATR_MULT',1.5);self.ssl=F('SHORT_SL_ATR_MULT',1.5)
-  self.ml=None;self.ml_min=F('ML_MIN_PROBABILITY',.62)
-  if B('ML_ENABLED',True) and joblib and os.path.exists(os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib')):
-   try:self.ml=joblib.load(os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib'))
+  self.confirm=max(1,I('SIGNAL_CONFIRM_CYCLES',2));self.ml=None;self.ml_min=F('ML_MIN_PROBABILITY',.62)
+  model_path=os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib')
+  if B('ML_ENABLED',True) and joblib and os.path.exists(model_path):
+   try:self.ml=joblib.load(model_path)
    except Exception:logging.exception('ML model load failed')
  def ohlcv(self,s,n=120):return self.c.fetch_ohlcv(s,timeframe=os.getenv('PUMP_TIMEFRAME','1m'),limit=n)
  def rsi(self,c,n=14):
@@ -39,25 +40,33 @@ class Engine:
    o=self.c.fetch_order_book(s,limit=50);b=sum(float(q)*float(px) for px,q in o.get('bids',[]) if float(px)>=p*(1-self.depth/100));a=sum(float(q)*float(px) for px,q in o.get('asks',[]) if float(px)<=p*(1+self.depth/100));bid=o.get('bids',[[p,0]])[0][0];ask=o.get('asks',[[p,0]])[0][0];return b/max(a+b,1e-12),(ask-bid)/p*100
   except Exception:return .5,999
  def signal(self,s):
-  x=self.ohlcv(s);c=np.array([z[4] for z in x],float);o=np.array([z[1] for z in x]);v=np.array([z[5] for z in x]);p=float(c[-1]);a=self.atr(x);r=self.rsi(c);vr=v[-1]/max(v[-21:-1].mean(),1e-12);m1=c[-1]/c[-2]-1;m3=c[-1]/c[-4]-1;m5=c[-1]/c[-6]-1;flow=self.flow(s);book,sp=self.book(s,p);vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12);vd=abs(p/vw-1)*100;green=sum(c[-2:] > o[-2:]);br=p>=max(c[-self.brk-1:-1]);
+  x=self.ohlcv(s);c=np.array([z[4] for z in x],float);o=np.array([z[1] for z in x]);v=np.array([z[5] for z in x]);p=float(c[-1]);a=self.atr(x);r=self.rsi(c);vr=v[-1]/max(v[-21:-1].mean(),1e-12);m1=c[-1]/c[-2]-1;m3=c[-1]/c[-4]-1;m5=c[-1]/c[-6]-1;flow=self.flow(s);book,sp=self.book(s,p);vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12);vd=abs(p/vw-1)*100;green=sum(c[-2:] > o[-2:]);br=p>=max(c[-self.brk-1:-1])
   long=br and m1>=self.m1 and m3>=self.m3 and m5<=self.m5 and vr>=self.vol and green>=2 and self.rmin<=r<=self.rmax and flow>=self.flowmin and book>=self.bookmin and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',4.5) and sp<=self.spread
   failed=max(c[-6:])>=max(c[-self.brk-2:-2]) and p<c[-2];short=m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',4.5)/100 and vr>=self.vol*.8 and failed and r>=F('PUMP_DUMP_MAX_RSI',72) and flow<=F('PUMP_DUMP_MIN_SELL_RATIO',.55) and book<=1-self.bookmin and sp<=self.spread
   if not(long or short):return None
-  side='long' if long else 'short';q=flow if long else 1-flow;bi=book if long else 1-book;score=min(.3*min(vr/5,1)+.2*min(abs(m5)/.05,1)+.25*q+.15*max((bi-.5)*2,0)+.1,1);mlp=0.
+  # SHORT has priority on ambiguous bars; LONG is also disallowed inside the exhaustion zone.
+  if short:side='short';q=1-flow;bi=1-book;reason='exhaustion'
+  else:side='long';q=flow;bi=book;reason='continuation'
+  score=min(.3*min(vr/5,1)+.2*min(abs(m5)/.05,1)+.25*q+.15*max((bi-.5)*2,0)+.1,1);mlp=0.
   if self.ml:
    try:
     feats=np.asarray([[score,r,vr,flow,book,vd,m5*100,a,m1,m3,sp]],float);mlp=float(self.ml['model'].predict_proba(feats)[0,1])
     if mlp<self.ml_min:return None
    except Exception:logging.exception('ML inference failed for %s',s)
-  return Signal(s,side,p,a,r,vr,flow,book,vd,m5*100,score,'continuation' if long else 'exhaustion',m1*100,m3*100,sp,mlp)
+  return Signal(s,side,p,a,r,vr,flow,book,vd,m5*100,score,reason,m1*100,m3*100,sp,mlp)
  def equity(self):
   try:b=self.c.fetch_balance({'type':'swap'});return float((b.get('total') or {}).get('USDT') or (b.get('USDT') or {}).get('total') or 0)
   except Exception:return 0
  def open(self,s):
-  if len(self.pos)>=self.maxpos:return
+  if len(self.pos)>=self.maxpos:return False
+  # Hard invariant: an order can only use the side encoded in the validated signal.
+  if s.side not in ('long','short'):raise ValueError(f'Invalid signal side: {s.side}')
   e=self.equity();d=s.atr*(self.ssl if s.side=='short' else self.sl);q=e*self.risk/d if e and d else 0;m=self.c.market(s.symbol);amin=float(((m.get('limits',{}).get('amount') or {}).get('min')) or 0);q=float(self.c.amount_to_precision(s.symbol,max(q,amin)))
-  if q<=0:return
-  self.c.set_leverage(self.lev,s.symbol);o=self.c.create_order(s.symbol,'market','buy' if s.side=='long' else 'sell',q,None,{'positionIdx':0});en=float(o.get('average') or o.get('price') or s.price);sg=1 if s.side=='long' else -1;stop=en-sg*d;t1=en+sg*d*self.tp1;t2=en+sg*d*self.tp2;t3=en+sg*d*self.tp3;self.pos[s.symbol]=Position(s.symbol,s.side,en,q,stop,t1,t2,t3,d);self.journal('open',self.pos[s.symbol],{'signal':asdict(s)})
+  if q<=0:return False
+  self.c.set_leverage(self.lev,s.symbol)
+  order_side='buy' if s.side=='long' else 'sell'
+  if (s.side=='long' and order_side!='buy') or (s.side=='short' and order_side!='sell'):raise RuntimeError('SIDE SAFETY CHECK FAILED')
+  o=self.c.create_order(s.symbol,'market',order_side,q,None,{'positionIdx':0});en=float(o.get('average') or o.get('price') or s.price);sg=1 if s.side=='long' else -1;stop=en-sg*d;t1=en+sg*d*self.tp1;t2=en+sg*d*self.tp2;t3=en+sg*d*self.tp3;self.pos[s.symbol]=Position(s.symbol,s.side,en,q,stop,t1,t2,t3,d);self.journal('open',self.pos[s.symbol],{'signal':asdict(s),'order_side':order_side});logging.info('ORDER OPENED | %s %s qty=%s entry=%s',s.side.upper(),s.symbol,q,en);return True
  def journal(self,event,p,extra=None):
   path=os.getenv('TRADE_JOURNAL_PATH','data/trades.jsonl');os.makedirs(os.path.dirname(path) or '.',exist_ok=True);open(path,'a',encoding='utf8').write(json.dumps({'ts':time.time(),'event':event,'position':asdict(p),**(extra or {})},default=str)+'\n')
  def manage(self):
@@ -81,17 +90,24 @@ class Engine:
   except Exception:pnl=0
   self.realized+=pnl;self.losses=self.losses+1 if pnl<0 else 0;self.journal('close',p,{'reason':reason,'pnl':pnl});self.pos.pop(p.symbol,None)
  def run(self,symbols):
-  signals=0;errors=0
+  signals=0;errors=0;opened=0
   for s in symbols:
    try:
     sig=self.signal(s)
     if sig:
      signals+=1
-     logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
-     if self.alert:self.alert(f"🚨 {sig.side.upper()} {s} score={sig.score:.2f} ML={sig.ml_prob:.2f} RSI={sig.rsi:.1f} vol={sig.vol:.1f}x flow={sig.flow:.2f} book={sig.book:.2f}")
-     if B('TRADING_ENABLED',False) and os.getenv('PUMP_MODE','alerts')=='trading':self.open(sig)
+     prev=self.pending.get(s)
+     count=prev[1]+1 if prev and prev[0]==sig.side else 1
+     self.pending[s]=(sig.side,count)
+     logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%% confirm=%s/%s',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread,count,self.confirm)
+     if self.alert:self.alert(f"🚨 {sig.side.upper()} {s} score={sig.score:.2f} ML={sig.ml_prob:.2f} RSI={sig.rsi:.1f} vol={sig.vol:.1f}x flow={sig.flow:.2f} book={sig.book:.2f} CONF={count}/{self.confirm}")
+     if B('TRADING_ENABLED',False) and os.getenv('PUMP_MODE','alerts')=='trading' and count>=self.confirm:
+      if self.open(sig):opened+=1
+      self.pending.pop(s,None)
+    else:
+     self.pending.pop(s,None)
    except Exception:
     errors+=1
     logging.exception('signal scan failed for %s',s)
   if B('TRADING_ENABLED',False):self.manage()
-  return {'signals':signals,'errors':errors}
+  return {'signals':signals,'errors':errors,'opened':opened}
