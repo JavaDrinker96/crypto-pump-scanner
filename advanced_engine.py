@@ -1,5 +1,5 @@
 """Advanced risk-first Bybit signal/execution engine used by pump_scanner."""
-import json,os,time
+import json,os,time,logging
 from dataclasses import dataclass,asdict
 import numpy as np
 try:
@@ -22,7 +22,7 @@ class Engine:
   self.ml=None;self.ml_min=F('ML_MIN_PROBABILITY',.62)
   if B('ML_ENABLED',True) and joblib and os.path.exists(os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib')):
    try:self.ml=joblib.load(os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib'))
-   except Exception:self.ml=None
+   except Exception:logging.exception('ML model load failed')
  def ohlcv(self,s,n=120):return self.c.fetch_ohlcv(s,timeframe=os.getenv('PUMP_TIMEFRAME','1m'),limit=n)
  def rsi(self,c,n=14):
   d=np.diff(c);g=np.maximum(d,0);l=np.maximum(-d,0);ag=g[:n].mean();al=l[:n].mean()
@@ -48,7 +48,7 @@ class Engine:
    try:
     feats=np.asarray([[score,r,vr,flow,book,vd,m5*100,a,m1,m3,sp]],float);mlp=float(self.ml['model'].predict_proba(feats)[0,1])
     if mlp<self.ml_min:return None
-   except Exception:pass
+   except Exception:logging.exception('ML inference failed for %s',s)
   return Signal(s,side,p,a,r,vr,flow,book,vd,m5*100,score,'continuation' if long else 'exhaustion',m1*100,m3*100,sp,mlp)
  def equity(self):
   try:b=self.c.fetch_balance({'type':'swap'});return float((b.get('total') or {}).get('USDT') or (b.get('USDT') or {}).get('total') or 0)
@@ -71,21 +71,27 @@ class Engine:
     a=self.atr(self.ohlcv(s,40));p.stop=max(p.stop,px-a*self.trail) if sg==1 else min(p.stop,px+a*self.trail)
    if (sg==1 and px>=p.tp3) or (sg==-1 and px<=p.tp3):self.close(p,'TP3')
  def partial(self,p,f,reason):
-  q=float(self.c.amount_to_precision(p.symbol,p.qty*f)
-  )
+  q=float(self.c.amount_to_precision(p.symbol,p.qty*f))
   if q<=0:return
   self.c.create_order(p.symbol,'market','sell' if p.side=='long' else 'buy',q,None,{'reduceOnly':True,'positionIdx':0});p.remaining-=f;self.journal(reason.lower(),p,{'qty':q})
  def close(self,p,reason):
-  q=float(self.c.amount_to_precision(p.symbol,p.qty*p.remaining));
+  q=float(self.c.amount_to_precision(p.symbol,p.qty*p.remaining))
   if q>0:self.c.create_order(p.symbol,'market','sell' if p.side=='long' else 'buy',q,None,{'reduceOnly':True,'positionIdx':0})
   try:px=float(self.c.fetch_ticker(p.symbol)['last']);pnl=(px-p.entry)*p.qty*(1 if p.side=='long' else -1)
   except Exception:pnl=0
   self.realized+=pnl;self.losses=self.losses+1 if pnl<0 else 0;self.journal('close',p,{'reason':reason,'pnl':pnl});self.pos.pop(p.symbol,None)
  def run(self,symbols):
+  signals=0;errors=0
   for s in symbols:
    try:
     sig=self.signal(s)
-    if sig and self.alert:self.alert(f"🚨 {sig.side.upper()} {s} score={sig.score:.2f} ML={sig.ml_prob:.2f} RSI={sig.rsi:.1f} vol={sig.vol:.1f}x flow={sig.flow:.2f} book={sig.book:.2f}")
-    if sig and B('TRADING_ENABLED',False) and os.getenv('PUMP_MODE','alerts')=='trading':self.open(sig)
-   except Exception:pass
+    if sig:
+     signals+=1
+     logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
+     if self.alert:self.alert(f"🚨 {sig.side.upper()} {s} score={sig.score:.2f} ML={sig.ml_prob:.2f} RSI={sig.rsi:.1f} vol={sig.vol:.1f}x flow={sig.flow:.2f} book={sig.book:.2f}")
+     if B('TRADING_ENABLED',False) and os.getenv('PUMP_MODE','alerts')=='trading':self.open(sig)
+   except Exception:
+    errors+=1
+    logging.exception('signal scan failed for %s',s)
   if B('TRADING_ENABLED',False):self.manage()
+  return {'signals':signals,'errors':errors}
