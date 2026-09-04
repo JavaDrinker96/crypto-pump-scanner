@@ -23,6 +23,7 @@ class Engine:
     def __init__(self, client, alert=None):
         self.c = client; self.alert = alert; self.pos = {}; self.realized = 0.; self.losses = 0; self.halted = False
         self.day = time.strftime('%Y-%m-%d', time.gmtime()); self.day_start = None; self.pending = {}
+        self.flow_cache = {}; self.book_cache = {}; self.flow_book_ttl = max(5, I('PUMP_FLOW_BOOK_CACHE_SEC', 20))
         self.vol = F('PUMP_VOL_SPIKE_MULT', 3); self.minvol = F('PUMP_MIN_DOLLAR_VOL', 5e6); self.m1 = F('PUMP_MIN_1M_MOVE_PCT', .006); self.m3 = F('PUMP_MIN_3M_MOVE_PCT', .012); self.m5 = F('PUMP_MAX_5M_MOVE_PCT', .045); self.brk = I('PUMP_BREAKOUT_LOOKBACK', 10)
         self.rmin = F('PUMP_MIN_RSI_ENTRY', 52); self.rmax = F('PUMP_MAX_RSI_ENTRY', 78); self.flowmin = F('PUMP_MIN_BUY_RATIO', .58); self.bookmin = F('PUMP_MIN_BOOK_IMBALANCE', .56); self.spread = F('MAX_SPREAD_PCT', .15); self.depth = F('ORDERBOOK_DEPTH_PCT', 1)
         self.risk = F('MAX_RISK_PER_TRADE_PCT', .5) / 100; self.dayloss = F('MAX_DAILY_LOSS_PCT', 2) / 100; self.maxloss = I('MAX_CONSECUTIVE_LOSSES', 3); self.maxpos = I('PUMP_MAX_POSITIONS', 2); self.lev = I('PUMP_LEVERAGE', 2)
@@ -43,18 +44,27 @@ class Engine:
         h=np.array([z[2] for z in x]); l=np.array([z[3] for z in x]); c=np.array([z[4] for z in x]); pc=c[:-1]
         tr=np.maximum(h[1:]-l[1:], np.maximum(abs(h[1:]-pc), abs(l[1:]-pc))); return float(tr[-n:].mean())
     def flow(self, s):
+        now=time.time(); hit=self.flow_cache.get(s)
+        if hit and now-hit[0] < self.flow_book_ttl: return hit[1]
         try: t=self.c.fetch_trades(s, limit=100)
         except Exception: return .5
-        b=sum(float(x.get('amount') or 0) for x in t if str(x.get('side')).lower()=='buy'); a=sum(float(x.get('amount') or 0) for x in t if str(x.get('side')).lower()=='sell'); return b/max(a+b,1e-12)
+        b=sum(float(x.get('amount') or 0) for x in t if str(x.get('side')).lower()=='buy'); a=sum(float(x.get('amount') or 0) for x in t if str(x.get('side')).lower()=='sell'); v=b/max(a+b,1e-12); self.flow_cache[s]=(now,v); return v
     def book(self, s, p):
+        now=time.time(); hit=self.book_cache.get(s)
+        if hit and now-hit[0] < self.flow_book_ttl: return hit[1], hit[2]
         try:
-            o=self.c.fetch_order_book(s,limit=50); b=sum(float(q)*float(px) for px,q in o.get('bids',[]) if float(px)>=p*(1-self.depth/100)); a=sum(float(q)*float(px) for px,q in o.get('asks',[]) if float(px)<=p*(1+self.depth/100)); bid=o.get('bids',[[p,0]])[0][0]; ask=o.get('asks',[[p,0]])[0][0]; return b/max(a+b,1e-12),(ask-bid)/p*100
+            o=self.c.fetch_order_book(s,limit=50); b=sum(float(q)*float(px) for px,q in o.get('bids',[]) if float(px)>=p*(1-self.depth/100)); a=sum(float(q)*float(px) for px,q in o.get('asks',[]) if float(px)<=p*(1+self.depth/100)); bid=o.get('bids',[[p,0]])[0][0]; ask=o.get('asks',[[p,0]])[0][0]; v=b/max(a+b,1e-12); sp=(ask-bid)/p*100; self.book_cache[s]=(now,v,sp); return v,sp
         except Exception: return .5,999
     def signal(self, s):
-        x=self.ohlcv(s); c=np.array([z[4] for z in x],float); o=np.array([z[1] for z in x]); v=np.array([z[5] for z in x]); p=float(c[-1]); a=self.atr(x); r=self.rsi(c); vr=v[-1]/max(v[-21:-1].mean(),1e-12); m1=c[-1]/c[-2]-1; m3=c[-1]/c[-4]-1; m5=c[-1]/c[-6]-1; flow=self.flow(s); book,sp=self.book(s,p); vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12); vd=abs(p/vw-1)*100; green=sum(c[-2:] > o[-2:]); br=p>=max(c[-self.brk-1:-1])
-        long = br and m1>=self.m1 and m3>=self.m3 and m5<=self.m5 and vr>=self.vol and green>=2 and self.rmin<=r<=self.rmax and flow>=self.flowmin and book>=self.bookmin and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',4.5) and sp<=self.spread
+        x=self.ohlcv(s); c=np.array([z[4] for z in x],float); o=np.array([z[1] for z in x]); v=np.array([z[5] for z in x]); p=float(c[-1]); a=self.atr(x); r=self.rsi(c); vr=v[-1]/max(v[-21:-1].mean(),1e-12); m1=c[-1]/c[-2]-1; m3=c[-1]/c[-4]-1; m5=c[-1]/c[-6]-1
+        vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12); vd=abs(p/vw-1)*100; green=sum(c[-2:] > o[-2:]); br=p>=max(c[-self.brk-1:-1])
         failed=max(c[-6:])>=max(c[-self.brk-2:-2]) and p<c[-2]
-        short = m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',4.5)/100 and vr>=self.vol*.8 and failed and r>=F('PUMP_DUMP_MAX_RSI',72) and flow<=F('PUMP_DUMP_MIN_SELL_RATIO',.55) and book<=1-self.bookmin and sp<=self.spread
+        pre_long = br and m1>=self.m1 and m3>=self.m3 and m5<=self.m5 and vr>=self.vol and green>=2 and self.rmin<=r<=self.rmax and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',4.5)
+        pre_short = m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',4.5)/100 and vr>=self.vol*.8 and failed and r>=F('PUMP_DUMP_MAX_RSI',72)
+        if not (pre_long or pre_short): return None
+        flow=self.flow(s); book,sp=self.book(s,p)
+        long = pre_long and flow>=self.flowmin and book>=self.bookmin and sp<=self.spread
+        short = pre_short and flow<=F('PUMP_DUMP_MIN_SELL_RATIO',.55) and book<=1-self.bookmin and sp<=self.spread
         if long and short:
             logging.warning('SIGNAL CONFLICT | %s | LONG and SHORT conditions both true; rejecting', s)
             return None
