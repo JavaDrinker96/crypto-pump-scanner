@@ -73,20 +73,39 @@ class Engine:
         c=np.array([z[4] for z in x],float); o=np.array([z[1] for z in x]); v=np.array([z[5] for z in x]); p=float(c[-1]); a=self.atr(x); r=self.rsi(c); vr=v[-1]/max(v[-21:-1].mean(),1e-12); m1=c[-1]/c[-2]-1; m3=c[-1]/c[-4]-1; m5=c[-1]/c[-6]-1
         vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12); vd=abs(p/vw-1)*100; green=sum(c[-2:] > o[-2:]); br=p>=max(c[-self.brk-1:-1])
         failed=max(c[-6:])>=max(c[-self.brk-2:-2]) and p<c[-2]
-        pre_long = br and m1>=self.m1 and m3>=self.m3 and m5<=self.m5 and vr>=self.vol and green>=2 and self.rmin<=r<=self.rmax and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',4.5)
-        pre_short = m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',4.5)/100 and vr>=self.vol*.8 and failed and r>=F('PUMP_DUMP_MAX_RSI',72)
+
+        long_checks = {
+            'breakout': br,
+            'm1': m1 >= self.m1,
+            'm3': m3 >= self.m3,
+            'm5_cap': m5 <= self.m5,
+            'volume': vr >= self.vol,
+            'green_2': green >= 2,
+            'rsi': self.rmin <= r <= self.rmax,
+            'vwap_distance': vd <= F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',4.5),
+        }
+        short_checks = {
+            'move5': m5 >= F('PUMP_MAX_ENTRY_5M_MOVE_PCT',4.5)/100,
+            'volume': vr >= self.vol*.8,
+            'failed_breakout': failed,
+            'rsi': r >= F('PUMP_DUMP_MAX_RSI',72),
+        }
+        pre_long = all(long_checks.values()); pre_short = all(short_checks.values())
+        for k,vv in long_checks.items():
+            if not vv: self._diag(f'long_fail_{k}')
+        for k,vv in short_checks.items():
+            if not vv: self._diag(f'short_fail_{k}')
         if not pre_long: self._diag('long_core_failed')
         if not pre_short: self._diag('short_core_failed')
-        if not (pre_long or pre_short): self._diag('no_core_candidate'); return None
+        if not (pre_long or pre_short):
+            self._diag('no_core_candidate'); return None
 
-        # Expensive public endpoints are consulted only after the OHLCV candidate survives.
         book,sp=self.book(s,p)
         if sp>self.spread:
             self._diag('spread_failed'); return None
         long_book = book>=self.bookmin; short_book = book<=1-self.bookmin
         if not (long_book or short_book):
             self._diag('book_imbalance_failed'); return None
-
         flow=self.flow(s)
         long = pre_long and flow>=self.flowmin and long_book
         short = pre_short and flow<=F('PUMP_DUMP_MIN_SELL_RATIO',.55) and short_book
@@ -161,6 +180,6 @@ class Engine:
             try: self.manage()
             except RateLimitExceeded:
                 errors+=1; self._diag('rate_limit_exceeded_manage'); logging.error('RATE LIMIT | manage | skipping position management this cycle')
-        top=sorted(self.diag.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        top=sorted(self.diag.items(), key=lambda kv: kv[1], reverse=True)[:12]
         if top: logging.info('FILTER DIAGNOSTICS | %s', ' | '.join(f'{k}={v}' for k,v in top))
         return {'signals':signals,'errors':errors}
