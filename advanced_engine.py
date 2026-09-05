@@ -6,6 +6,10 @@ try:
     import joblib
 except Exception:
     joblib = None
+try:
+    from ccxt.base.errors import RateLimitExceeded
+except Exception:
+    RateLimitExceeded = Exception
 
 F = lambda k, d: float(os.getenv(k, d))
 I = lambda k, d: int(os.getenv(k, d))
@@ -23,7 +27,7 @@ class Engine:
     def __init__(self, client, alert=None):
         self.c = client; self.alert = alert; self.pos = {}; self.realized = 0.; self.losses = 0; self.halted = False
         self.day = time.strftime('%Y-%m-%d', time.gmtime()); self.day_start = None; self.pending = {}
-        self.flow_cache = {}; self.book_cache = {}; self.flow_book_ttl = max(5, I('PUMP_FLOW_BOOK_CACHE_SEC', 20))
+        self.flow_cache = {}; self.book_cache = {}; self.flow_book_ttl = max(5, I('PUMP_FLOW_BOOK_CACHE_SEC', 20)); self.diag = {}
         self.vol = F('PUMP_VOL_SPIKE_MULT', 3); self.minvol = F('PUMP_MIN_DOLLAR_VOL', 5e6); self.m1 = F('PUMP_MIN_1M_MOVE_PCT', .006); self.m3 = F('PUMP_MIN_3M_MOVE_PCT', .012); self.m5 = F('PUMP_MAX_5M_MOVE_PCT', .045); self.brk = I('PUMP_BREAKOUT_LOOKBACK', 10)
         self.rmin = F('PUMP_MIN_RSI_ENTRY', 52); self.rmax = F('PUMP_MAX_RSI_ENTRY', 78); self.flowmin = F('PUMP_MIN_BUY_RATIO', .58); self.bookmin = F('PUMP_MIN_BOOK_IMBALANCE', .56); self.spread = F('MAX_SPREAD_PCT', .15); self.depth = F('ORDERBOOK_DEPTH_PCT', 1)
         self.risk = F('MAX_RISK_PER_TRADE_PCT', .5) / 100; self.dayloss = F('MAX_DAILY_LOSS_PCT', 2) / 100; self.maxloss = I('MAX_CONSECUTIVE_LOSSES', 3); self.maxpos = I('PUMP_MAX_POSITIONS', 2); self.lev = I('PUMP_LEVERAGE', 2)
@@ -35,7 +39,10 @@ class Engine:
             try: self.ml = joblib.load(model_path)
             except Exception: logging.exception('ML model load failed')
 
-    def ohlcv(self, s, n=120): return self.c.fetch_ohlcv(s, timeframe=os.getenv('PUMP_TIMEFRAME', '1m'), limit=n)
+    def _diag(self, key):
+        self.diag[key] = self.diag.get(key, 0) + 1
+    def ohlcv(self, s, n=120):
+        return self.c.fetch_ohlcv(s, timeframe=os.getenv('PUMP_TIMEFRAME', '1m'), limit=n)
     def rsi(self, c, n=14):
         d=np.diff(c); g=np.maximum(d,0); l=np.maximum(-d,0); ag=g[:n].mean(); al=l[:n].mean()
         for i in range(n,len(d)): ag=(ag*(n-1)+g[i])/n; al=(al*(n-1)+l[i])/n
@@ -47,35 +54,55 @@ class Engine:
         now=time.time(); hit=self.flow_cache.get(s)
         if hit and now-hit[0] < self.flow_book_ttl: return hit[1]
         try: t=self.c.fetch_trades(s, limit=100)
-        except Exception: return .5
+        except RateLimitExceeded: raise
+        except Exception:
+            self._diag('flow_fetch_failed'); return .5
         b=sum(float(x.get('amount') or 0) for x in t if str(x.get('side')).lower()=='buy'); a=sum(float(x.get('amount') or 0) for x in t if str(x.get('side')).lower()=='sell'); v=b/max(a+b,1e-12); self.flow_cache[s]=(now,v); return v
     def book(self, s, p):
         now=time.time(); hit=self.book_cache.get(s)
         if hit and now-hit[0] < self.flow_book_ttl: return hit[1], hit[2]
         try:
             o=self.c.fetch_order_book(s,limit=50); b=sum(float(q)*float(px) for px,q in o.get('bids',[]) if float(px)>=p*(1-self.depth/100)); a=sum(float(q)*float(px) for px,q in o.get('asks',[]) if float(px)<=p*(1+self.depth/100)); bid=o.get('bids',[[p,0]])[0][0]; ask=o.get('asks',[[p,0]])[0][0]; v=b/max(a+b,1e-12); sp=(ask-bid)/p*100; self.book_cache[s]=(now,v,sp); return v,sp
-        except Exception: return .5,999
+        except RateLimitExceeded: raise
+        except Exception:
+            self._diag('book_fetch_failed'); return .5,999
     def signal(self, s):
-        x=self.ohlcv(s); c=np.array([z[4] for z in x],float); o=np.array([z[1] for z in x]); v=np.array([z[5] for z in x]); p=float(c[-1]); a=self.atr(x); r=self.rsi(c); vr=v[-1]/max(v[-21:-1].mean(),1e-12); m1=c[-1]/c[-2]-1; m3=c[-1]/c[-4]-1; m5=c[-1]/c[-6]-1
+        x=self.ohlcv(s)
+        if len(x) < 30:
+            self._diag('insufficient_ohlcv'); return None
+        c=np.array([z[4] for z in x],float); o=np.array([z[1] for z in x]); v=np.array([z[5] for z in x]); p=float(c[-1]); a=self.atr(x); r=self.rsi(c); vr=v[-1]/max(v[-21:-1].mean(),1e-12); m1=c[-1]/c[-2]-1; m3=c[-1]/c[-4]-1; m5=c[-1]/c[-6]-1
         vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12); vd=abs(p/vw-1)*100; green=sum(c[-2:] > o[-2:]); br=p>=max(c[-self.brk-1:-1])
         failed=max(c[-6:])>=max(c[-self.brk-2:-2]) and p<c[-2]
         pre_long = br and m1>=self.m1 and m3>=self.m3 and m5<=self.m5 and vr>=self.vol and green>=2 and self.rmin<=r<=self.rmax and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',4.5)
         pre_short = m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',4.5)/100 and vr>=self.vol*.8 and failed and r>=F('PUMP_DUMP_MAX_RSI',72)
-        if not (pre_long or pre_short): return None
-        flow=self.flow(s); book,sp=self.book(s,p)
-        long = pre_long and flow>=self.flowmin and book>=self.bookmin and sp<=self.spread
-        short = pre_short and flow<=F('PUMP_DUMP_MIN_SELL_RATIO',.55) and book<=1-self.bookmin and sp<=self.spread
+        if not pre_long: self._diag('long_core_failed')
+        if not pre_short: self._diag('short_core_failed')
+        if not (pre_long or pre_short): self._diag('no_core_candidate'); return None
+
+        # Expensive public endpoints are consulted only after the OHLCV candidate survives.
+        book,sp=self.book(s,p)
+        if sp>self.spread:
+            self._diag('spread_failed'); return None
+        long_book = book>=self.bookmin; short_book = book<=1-self.bookmin
+        if not (long_book or short_book):
+            self._diag('book_imbalance_failed'); return None
+
+        flow=self.flow(s)
+        long = pre_long and flow>=self.flowmin and long_book
+        short = pre_short and flow<=F('PUMP_DUMP_MIN_SELL_RATIO',.55) and short_book
+        if not long: self._diag('long_flow_or_book_failed')
+        if not short: self._diag('short_flow_or_book_failed')
         if long and short:
-            logging.warning('SIGNAL CONFLICT | %s | LONG and SHORT conditions both true; rejecting', s)
-            return None
-        if not (long or short): return None
+            logging.warning('SIGNAL CONFLICT | %s | LONG and SHORT conditions both true; rejecting', s); self._diag('signal_conflict'); return None
+        if not (long or short): self._diag('flow_filter_failed'); return None
+
         side='long' if long else 'short'; q=flow if long else 1-flow; bi=book if long else 1-book
         score=min(.3*min(vr/5,1)+.2*min(abs(m5)/.05,1)+.25*q+.15*max((bi-.5)*2,0)+.1,1); mlp=0.
         if self.ml:
             try:
                 feats=np.asarray([[score,r,vr,flow,book,vd,m5*100,a,m1,m3,sp]],float); mlp=float(self.ml['model'].predict_proba(feats)[0,1]);
-                if mlp<self.ml_min: return None
-            except Exception: logging.exception('ML inference failed for %s', s)
+                if mlp<self.ml_min: self._diag('ml_rejected'); return None
+            except Exception: self._diag('ml_inference_failed'); logging.exception('ML inference failed for %s', s)
         return Signal(s,side,p,a,r,vr,flow,book,vd,m5*100,score,'continuation' if long else 'exhaustion',m1*100,m3*100,sp,mlp)
     def equity(self):
         try: b=self.c.fetch_balance({'type':'swap'}); return float((b.get('total') or {}).get('USDT') or (b.get('USDT') or {}).get('total') or 0)
@@ -94,6 +121,7 @@ class Engine:
     def manage(self):
         for s,p in list(self.pos.items()):
             try: px=float(self.c.fetch_ticker(s)['last']); sg=1 if p.side=='long' else -1
+            except RateLimitExceeded: raise
             except Exception: continue
             if (sg==1 and px<=p.stop) or (sg==-1 and px>=p.stop): self.close(p,'SL'); continue
             if not p.tp1_done and ((sg==1 and px>=p.tp1) or (sg==-1 and px<=p.tp1)): self.partial(p,self.tq1,'TP1'); p.tp1_done=True
@@ -112,23 +140,27 @@ class Engine:
         except Exception: pnl=0
         self.realized+=pnl; self.losses=self.losses+1 if pnl<0 else 0; self.journal('close',p,{'reason':reason,'pnl':pnl}); self.pos.pop(p.symbol,None)
     def run(self,symbols):
-        signals=0; errors=0
+        signals=0; errors=0; self.diag={}
         for s in symbols:
             try:
                 sig=self.signal(s)
                 if not sig:
-                    self.pending.pop(s,None)
-                    continue
+                    self.pending.pop(s,None); continue
                 signals+=1
                 logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
-                state=self.pending.get(s)
-                count=(state[1]+1) if state and state[0]==sig.side else 1
-                self.pending[s]=(sig.side,count)
+                state=self.pending.get(s); count=(state[1]+1) if state and state[0]==sig.side else 1; self.pending[s]=(sig.side,count)
                 logging.info('CONFIRM | %s %s %d/%d',sig.side.upper(),s,count,self.confirm)
                 if self.alert: self.alert(f"🚨 {sig.side.upper()} {s} score={sig.score:.2f} CONF={count}/{self.confirm} ML={sig.ml_prob:.2f}")
                 if count>=self.confirm and B('TRADING_ENABLED',False) and os.getenv('PUMP_MODE','alerts')=='trading' and s not in self.pos:
                     self.open(sig); self.pending.pop(s,None)
+            except RateLimitExceeded:
+                errors+=1; self._diag('rate_limit_exceeded'); logging.error('RATE LIMIT | %s | ending scan cycle early',s); break
             except Exception:
-                errors+=1; logging.exception('signal scan failed for %s',s)
-        if B('TRADING_ENABLED',False): self.manage()
+                errors+=1; self._diag('unexpected_scan_error'); logging.exception('signal scan failed for %s',s)
+        if B('TRADING_ENABLED',False):
+            try: self.manage()
+            except RateLimitExceeded:
+                errors+=1; self._diag('rate_limit_exceeded_manage'); logging.error('RATE LIMIT | manage | skipping position management this cycle')
+        top=sorted(self.diag.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        if top: logging.info('FILTER DIAGNOSTICS | %s', ' | '.join(f'{k}={v}' for k,v in top))
         return {'signals':signals,'errors':errors}
