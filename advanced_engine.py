@@ -7,9 +7,10 @@ try:
 except Exception:
     joblib = None
 try:
-    from ccxt.base.errors import RateLimitExceeded
+    from ccxt.base.errors import RateLimitExceeded, BadRequest
 except Exception:
     RateLimitExceeded = Exception
+    BadRequest = Exception
 
 F = lambda k, d: float(os.getenv(k, d))
 I = lambda k, d: int(os.getenv(k, d))
@@ -134,7 +135,19 @@ class Engine:
         logging.info('ORDER INTENT | signal=%s | order_side=%s | symbol=%s | qty=%s', s.side, order_side, s.symbol, q)
         if (s.side=='long') != (order_side=='buy'):
             raise RuntimeError(f'order-side mismatch for {s.symbol}: signal={s.side} order={order_side}')
-        self.c.set_leverage(self.lev,s.symbol); o=self.c.create_order(s.symbol,'market',order_side,q,None,{'positionIdx':0}); en=float(o.get('average') or o.get('price') or s.price); sg=1 if s.side=='long' else -1; stop=en-sg*d; t1=en+sg*d*self.tp1; t2=en+sg*d*self.tp2; t3=en+sg*d*self.tp3; self.pos[s.symbol]=Position(s.symbol,s.side,en,q,stop,t1,t2,t3,d); self.journal('open',self.pos[s.symbol],{'signal':asdict(s),'order_side':order_side})
+        try:
+            self.c.set_leverage(self.lev,s.symbol)
+        except BadRequest as e:
+            if '110043' not in str(e):
+                raise
+            logging.info('LEVERAGE UNCHANGED | symbol=%s | leverage=%s | continuing to order', s.symbol, self.lev)
+        try:
+            o=self.c.create_order(s.symbol,'market',order_side,q,None,{'positionIdx':0})
+        except Exception:
+            logging.exception('ORDER FAILED | symbol=%s | side=%s | qty=%s', s.symbol, order_side, q)
+            raise
+        logging.info('ORDER EXECUTED | symbol=%s | side=%s | qty=%s | id=%s | status=%s', s.symbol, order_side, q, o.get('id'), o.get('status'))
+        en=float(o.get('average') or o.get('price') or s.price); sg=1 if s.side=='long' else -1; stop=en-sg*d; t1=en+sg*d*self.tp1; t2=en+sg*d*self.tp2; t3=en+sg*d*self.tp3; self.pos[s.symbol]=Position(s.symbol,s.side,en,q,stop,t1,t2,t3,d); self.journal('open',self.pos[s.symbol],{'signal':asdict(s),'order_side':order_side,'order_id':o.get('id')})
     def journal(self,event,p,extra=None):
         path=os.getenv('TRADE_JOURNAL_PATH','data/trades.jsonl'); os.makedirs(os.path.dirname(path) or '.',exist_ok=True); open(path,'a',encoding='utf8').write(json.dumps({'ts':time.time(),'event':event,'position':asdict(p),**(extra or {})},default=str)+'\n')
     def manage(self):
