@@ -1,5 +1,12 @@
 """Production entrypoint for the advanced DeepAlpha engine."""
 import os,time,logging,ccxt
+# Railway does not guarantee Python's implicit sitecustomize import path.
+# Load the runtime patch explicitly before importing Engine so ML/WS overrides
+# are definitely installed on the Engine class.
+try:
+    import sitecustomize  # noqa: F401
+except Exception:
+    logging.exception('RUNTIME PATCH | explicit sitecustomize import failed')
 from ccxt.base.errors import AuthenticationError
 from advanced_engine import Engine
 from ws_market import BybitMarketWS
