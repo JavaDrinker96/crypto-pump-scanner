@@ -1,180 +1,104 @@
-"""Runtime safety patch for ML gating and exchange-native Bybit TP/SL."""
-import logging
-import os
-
+"""Runtime patch: fail-closed ML, Bybit WS market data, native TP/SL + runner trailing stop."""
+import logging, os
 try:
-    import numpy as np
-    import joblib
-except Exception:
-    np = None
-    joblib = None
-
+    import numpy as np, joblib
+except Exception: np=joblib=None
 try:
     import advanced_engine
 except Exception:
-    logging.exception("RUNTIME PATCH | failed to import advanced_engine")
+    logging.exception('RUNTIME PATCH | advanced_engine import failed')
 else:
-    _original_init = advanced_engine.Engine.__init__
-    _original_signal = advanced_engine.Engine.signal
-    _original_open = advanced_engine.Engine.open
-
-    def _model_path():
-        return os.getenv("ML_MODEL_PATH", "data/models/pump_classifier.joblib")
-
-    def _train_model(client):
-        if np is None or joblib is None:
-            raise RuntimeError("numpy/joblib unavailable")
-        try:
-            from sklearn.ensemble import RandomForestClassifier
-            from sklearn.model_selection import train_test_split
-            from sklearn.metrics import roc_auc_score
-        except Exception as exc:
-            raise RuntimeError(f"scikit-learn unavailable: {exc}")
-
-        symbols = [s.strip() for s in os.getenv("ML_TRAIN_SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,DOGE/USDT:USDT,BNB/USDT:USDT").split(",") if s.strip()]
-        limit = max(300, int(os.getenv("ML_TRAIN_CANDLES", "700")))
-        threshold = float(os.getenv("ML_LABEL_RETURN_PCT", "0.25")) / 100.0
-        X, y = [], []
-
-        def rsi(c, n=14):
-            d = np.diff(c); g = np.maximum(d, 0); l = np.maximum(-d, 0)
-            ag = g[:n].mean(); al = l[:n].mean()
-            for i in range(n, len(d)):
-                ag = (ag * (n - 1) + g[i]) / n
-                al = (al * (n - 1) + l[i]) / n
-            return 100.0 if al <= 1e-12 else 100.0 - 100.0 / (1.0 + ag / al)
-
-        for symbol in symbols:
+    _init=advanced_engine.Engine.__init__; _signal=advanced_engine.Engine.signal; _open=advanced_engine.Engine.open
+    _ohlcv=advanced_engine.Engine.ohlcv; _flow=advanced_engine.Engine.flow; _book=advanced_engine.Engine.book
+    def _path(): return os.getenv('ML_MODEL_PATH','data/models/pump_classifier.joblib')
+    def _train(client):
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import roc_auc_score
+        symbols=[s.strip() for s in os.getenv('ML_TRAIN_SYMBOLS','BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,DOGE/USDT:USDT,BNB/USDT:USDT').split(',') if s.strip()]
+        limit=max(300,int(os.getenv('ML_TRAIN_CANDLES','700'))); threshold=float(os.getenv('ML_LABEL_RETURN_PCT','0.25'))/100; X=[]; y=[]
+        def rsi(c,n=14):
+            d=np.diff(c); g=np.maximum(d,0); l=np.maximum(-d,0); ag=g[:n].mean(); al=l[:n].mean()
+            for j in range(n,len(d)): ag=(ag*(n-1)+g[j])/n; al=(al*(n-1)+l[j])/n
+            return 100 if al<=1e-12 else 100-100/(1+ag/al)
+        for s in symbols:
             try:
-                candles = client.fetch_ohlcv(symbol, timeframe=os.getenv("PUMP_TIMEFRAME", "1m"), limit=limit)
-                if len(candles) < 80:
-                    continue
-                c = np.asarray([z[4] for z in candles], dtype=float)
-                h = np.asarray([z[2] for z in candles], dtype=float)
-                l = np.asarray([z[3] for z in candles], dtype=float)
-                o = np.asarray([z[1] for z in candles], dtype=float)
-                v = np.asarray([z[5] for z in candles], dtype=float)
-                for i in range(30, len(c) - 5):
-                    cc = c[:i + 1]; vv = v[:i + 1]; p = float(cc[-1])
-                    rr = rsi(cc); vr = float(vv[-1] / max(vv[-21:-1].mean(), 1e-12))
-                    m1 = float(cc[-1] / cc[-2] - 1.0); m3 = float(cc[-1] / cc[-4] - 1.0); m5 = float(cc[-1] / cc[-6] - 1.0)
-                    tr = np.maximum(h[1:i + 1] - l[1:i + 1], np.maximum(np.abs(h[1:i + 1] - c[:i]), np.abs(l[1:i + 1] - c[:i])))
-                    atr = float(tr[-14:].mean())
-                    lo = max(0, i - 29)
-                    vw = sum(((candles[j][2] + candles[j][3] + candles[j][4]) / 3.0) * candles[j][5] for j in range(lo, i + 1)) / max(sum(candles[j][5] for j in range(lo, i + 1)), 1e-12)
-                    vd = abs(p / vw - 1.0) * 100.0
-                    rng = max(h[i] - l[i], 1e-12)
-                    flow_proxy = float(np.clip(0.5 + ((c[i] - o[i]) / rng) * 0.25, 0.0, 1.0))
-                    book_proxy = float(np.clip(0.5 + ((c[i] - l[i]) / rng - 0.5) * 0.5, 0.0, 1.0))
-                    spread_proxy = float(min(1.0, atr / max(p, 1e-12) * 100.0))
-                    score = min(0.3 * min(vr / 5.0, 1.0) + 0.2 * min(abs(m5) / 0.05, 1.0) + 0.25 * flow_proxy + 0.15 * max((book_proxy - 0.5) * 2, 0.0) + 0.1, 1.0)
-                    future = float(c[i + 5] / c[i] - 1.0)
-                    base = [score, rr, vr, flow_proxy, book_proxy, vd, m5 * 100.0, atr, m1, m3, spread_proxy]
-                    X.append(base + [1.0]); y.append(int(future >= threshold))
-                    X.append(base + [-1.0]); y.append(int(future <= -threshold))
-            except Exception:
-                logging.exception("ML TRAIN | failed for %s", symbol)
-
-        if len(X) < 500 or len(set(y)) < 2:
-            raise RuntimeError(f"insufficient training data: samples={len(X)} classes={sorted(set(y))}")
-        X = np.asarray(X, dtype=float); y = np.asarray(y, dtype=int)
-        xa, xb, ya, yb = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
-        model = RandomForestClassifier(n_estimators=250, max_depth=8, min_samples_leaf=10, class_weight="balanced_subsample", random_state=42, n_jobs=-1)
-        model.fit(xa, ya)
-        try: auc = roc_auc_score(yb, model.predict_proba(xb)[:, 1])
-        except Exception: auc = 0.0
-        path = _model_path(); os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        joblib.dump({"model": model, "feature_count": 12, "label_threshold": threshold, "symbols": symbols, "auc": auc}, path)
-        logging.info("ML TRAINED | samples=%s | positives=%s | auc=%.3f | path=%s", len(y), int(y.sum()), auc, path)
-        return path
-
-    def _patched_init(self, client, alert=None):
-        _original_init(self, client, alert)
-        self.ml_required = os.getenv("ML_REQUIRED", "true").lower() in ("1", "true", "yes", "on")
-        enabled = os.getenv("ML_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-        path = _model_path()
-        if not enabled:
-            if self.ml_required: logging.error("ML BLOCKED | ML_ENABLED=false while ML_REQUIRED=true")
-            return
-        if self.ml is None and os.getenv("ML_AUTO_TRAIN", "true").lower() in ("1", "true", "yes", "on"):
+                rows=client.fetch_ohlcv(s,timeframe=os.getenv('PUMP_TIMEFRAME','1m'),limit=limit)
+                if len(rows)<80: continue
+                c=np.asarray([z[4] for z in rows],float); h=np.asarray([z[2] for z in rows],float); l=np.asarray([z[3] for z in rows],float); o=np.asarray([z[1] for z in rows],float); v=np.asarray([z[5] for z in rows],float)
+                for i in range(30,len(c)-5):
+                    cc=c[:i+1]; vr=v[i]/max(v[i-20:i].mean(),1e-12); m1=cc[-1]/cc[-2]-1; m3=cc[-1]/cc[-4]-1; m5=cc[-1]/cc[-6]-1; rr=rsi(cc); tr=np.maximum(h[1:i+1]-l[1:i+1],np.maximum(abs(h[1:i+1]-c[:i]),abs(l[1:i+1]-c[:i]))); atr=float(tr[-14:].mean()); lo=max(0,i-29); vw=sum(((rows[j][2]+rows[j][3]+rows[j][4])/3)*rows[j][5] for j in range(lo,i+1))/max(sum(rows[j][5] for j in range(lo,i+1)),1e-12); vd=abs(cc[-1]/vw-1)*100; rng=max(h[i]-l[i],1e-12); fp=float(np.clip(.5+((c[i]-o[i])/rng)*.25,0,1)); bp=float(np.clip(.5+((c[i]-l[i])/rng-.5)*.5,0,1)); sp=float(min(1,atr/max(c[i],1e-12)*100)); score=min(.3*min(vr/5,1)+.2*min(abs(m5)/.05,1)+.25*fp+.15*max((bp-.5)*2,0)+.1,1); base=[score,rr,vr,fp,bp,vd,m5*100,atr,m1,m3,sp]; future=c[i+5]/c[i]-1
+                    X.append(base+[1.0]); y.append(int(future>=threshold)); X.append(base+[-1.0]); y.append(int(future<=-threshold))
+            except Exception: logging.exception('ML TRAIN | failed for %s',s)
+        if len(X)<500 or len(set(y))<2: raise RuntimeError(f'insufficient training data: samples={len(X)} classes={sorted(set(y))}')
+        xa,xb,ya,yb=train_test_split(np.asarray(X,float),np.asarray(y,int),test_size=.25,random_state=42,stratify=y); model=RandomForestClassifier(n_estimators=300,max_depth=8,min_samples_leaf=10,class_weight='balanced_subsample',random_state=42,n_jobs=-1); model.fit(xa,ya); auc=roc_auc_score(yb,model.predict_proba(xb)[:,1]); path=_path(); os.makedirs(os.path.dirname(path) or '.',exist_ok=True); joblib.dump({'model':model,'feature_count':12,'label_threshold':threshold,'symbols':symbols,'auc':auc},path); logging.info('ML TRAINED | samples=%s | positives=%s | auc=%.3f | path=%s',len(y),int(np.sum(y)),auc,path)
+    def _patched_init(self,client,alert=None):
+        _init(self,client,alert); self.ml_required=os.getenv('ML_REQUIRED','true').lower() in ('1','true','yes','on'); enabled=os.getenv('ML_ENABLED','true').lower() in ('1','true','yes','on'); path=_path(); self.ws=getattr(client,'ws_market',None)
+        if self.ws: logging.info('MARKET DATA | Bybit public WebSocket enabled')
+        self.ml=None
+        if enabled and joblib:
             try:
-                _train_model(client)
-                self.ml = joblib.load(path)
-                logging.info("ML STATUS | enabled=true | loaded=true | source=auto-trained | path=%s", path)
-            except Exception:
-                logging.exception("ML AUTO TRAIN FAILED | trading will remain blocked")
-        elif self.ml is not None:
-            logging.info("ML STATUS | enabled=true | loaded=true | path=%s", path)
-        else:
-            logging.error("ML STATUS | enabled=true | loaded=false | path=%s", path)
-
-    def _patched_signal(self, symbol):
-        saved = getattr(self, "ml", None)
-        self.ml = None
+                if os.path.exists(path):
+                    candidate=joblib.load(path); fc=candidate.get('feature_count') if isinstance(candidate,dict) else None
+                    if fc==12: self.ml=candidate
+                    else: logging.warning('ML MODEL INCOMPATIBLE | feature_count=%s expected=12 | retraining',fc)
+            except Exception: logging.exception('ML model load failed; retraining')
+            if self.ml is None and os.getenv('ML_AUTO_TRAIN','true').lower() in ('1','true','yes','on'):
+                try: _train(client); self.ml=joblib.load(path); logging.info('ML STATUS | enabled=true | loaded=true | source=auto-trained | path=%s',path)
+                except Exception: logging.exception('ML AUTO TRAIN FAILED | trading remains blocked')
+        if self.ml is None: logging.error('ML STATUS | enabled=%s | loaded=false | required=%s | path=%s',enabled,self.ml_required,path)
+        else: logging.info('ML STATUS | enabled=true | loaded=true | auc=%s | path=%s',self.ml.get('auc') if isinstance(self.ml,dict) else 'n/a',path)
+    def _ws_ohlcv(self,s,n=120):
+        if getattr(self,'ws',None): return self.ws.get_ohlcv(s,lambda sym,lim:_ohlcv(self,sym,lim),n)
+        return _ohlcv(self,s,n)
+    def _ws_flow(self,s):
+        if getattr(self,'ws',None):
+            t=self.ws.get_trades(s)
+            if t:
+                b=sum(x['amount'] for x in t if x['side']=='buy'); a=sum(x['amount'] for x in t if x['side']=='sell'); return b/max(a+b,1e-12)
+        return _flow(self,s)
+    def _ws_book(self,s,p):
+        if getattr(self,'ws',None):
+            o=self.ws.get_order_book(s)
+            if o and o.get('bids') and o.get('asks'):
+                depth=self.depth; b=sum(float(q)*float(px) for px,q in o['bids'] if float(px)>=p*(1-depth/100)); a=sum(float(q)*float(px) for px,q in o['asks'] if float(px)<=p*(1+depth/100)); return b/max(a+b,1e-12),(float(o['asks'][0][0])-float(o['bids'][0][0]))/p*100
+        return _book(self,s,p)
+    def _patched_signal(self,symbol):
+        saved=self.ml; self.ml=None
+        try: sig=_signal(self,symbol)
+        finally: self.ml=saved
+        if sig is None:return None
+        if self.ml_required and saved is None: self._diag('ml_unavailable'); logging.warning('ML BLOCK | %s | no compatible model',symbol); return None
         try:
-            sig = _original_signal(self, symbol)
-        finally:
-            self.ml = saved
-        if sig is None:
-            return None
-        if getattr(self, "ml_required", True) and saved is None:
-            self._diag("ml_unavailable"); logging.warning("ML BLOCK | %s | no model", symbol); return None
-        try:
-            side_sign = 1.0 if sig.side == "long" else -1.0
-            feats = np.asarray([[sig.score, sig.rsi, sig.vol, sig.flow, sig.book, sig.vwap, sig.move5, sig.atr, sig.m1 / 100.0, sig.m3 / 100.0, sig.spread, side_sign]], dtype=float)
-            raw_model = saved.get("model") if isinstance(saved, dict) else saved
-            mlp = float(raw_model.predict_proba(feats)[0, 1])
-            sig.ml_prob = mlp
-            if not np.isfinite(mlp) or mlp < float(os.getenv("ML_MIN_PROBABILITY", "0.58")):
-                self._diag("ml_rejected"); logging.info("ML REJECT | %s | side=%s | probability=%.3f | min=%.3f", symbol, sig.side, mlp, float(os.getenv("ML_MIN_PROBABILITY", "0.58"))); return None
-            logging.info("ML ACCEPT | %s | side=%s | probability=%.3f", symbol, sig.side, mlp)
-            return sig
+            side=1. if sig.side=='long' else -1.; feats=np.asarray([[sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.vwap,sig.move5,sig.atr,sig.m1/100,sig.m3/100,sig.spread,side]],float); model=saved['model'] if isinstance(saved,dict) else saved; prob=float(model.predict_proba(feats)[0,1]); sig.ml_prob=prob; minimum=float(os.getenv('ML_MIN_PROBABILITY','0.58'))
+            if not np.isfinite(prob) or prob<minimum: self._diag('ml_rejected'); logging.info('ML REJECT | %s | probability=%.3f | min=%.3f',symbol,prob,minimum); return None
+            logging.info('ML ACCEPT | %s | side=%s | probability=%.3f',symbol,sig.side,prob); return sig
+        except Exception: self._diag('ml_inference_failed'); logging.exception('ML INFERENCE FAILED | %s',symbol); return None
+    def _protect(self,p):
+        def req(params):
+            return self.c.request('v5/position/trading-stop','private','POST',params)
+        symbol=self.c.market(p.symbol).get('id') or p.symbol.replace('/','').replace(':USDT',''); q1=float(os.getenv('TP1_CLOSE_PCT','.35')); q2=float(os.getenv('TP2_CLOSE_PCT','.35')); q3=max(0,1-q1-q2)
+        for name,tp,f in [('TP1',p.tp1,q1),('TP2',p.tp2,q2)]:
+            qty=float(self.c.amount_to_precision(p.symbol,p.qty*f)); params={'category':'linear','symbol':symbol,'positionIdx':0,'tpslMode':'Partial','takeProfit':str(tp),'stopLoss':str(p.stop),'tpSize':str(qty),'slSize':str(qty),'tpOrderType':'Market','slOrderType':'Market','tpTriggerBy':'MarkPrice','slTriggerBy':'MarkPrice'}; r=req(params)
+            if not isinstance(r,dict) or r.get('retCode',0)!=0: raise RuntimeError(f'Bybit TP/SL failed: {r}')
+            logging.info('PROTECTION SET | %s | %s qty=%s tp=%s sl=%s',p.symbol,name,qty,tp,p.stop)
+        if q3>0:
+            qty=float(self.c.amount_to_precision(p.symbol,p.qty*q3)); distance=float(p.risk)*float(os.getenv('TRAILING_ATR_MULT','1.5')); active=p.tp2
+            side='sell' if p.side=='long' else 'buy'; params={'category':'linear','symbol':symbol,'positionIdx':0,'side':side,'orderType':'Market','qty':str(qty),'triggerDirection':1 if p.side=='long' else 2,'triggerPrice':str(active),'triggerBy':'MarkPrice','stopOrderType':'TrailingStop','trailingStop':str(distance),'reduceOnly':True,'closeOnTrigger':True}
+            r=self.c.create_order(p.symbol,'market',side,qty,None,params)
+            logging.info('RUNNER TRAILING SET | %s | qty=%s | activation=%s | distance=%s | order=%s',p.symbol,qty,active,distance,r.get('id'))
+        self.journal('protection',p,{'mode':'TP1+TP2+exchange_trailing_runner','runner_fraction':q3})
+    def _open_with_protection(self,s):
+        before=set(self.pos); _open(self,s)
+        if s.symbol not in self.pos or s.symbol in before:return
+        p=self.pos[s.symbol]
+        try:_protect(self,p)
         except Exception:
-            self._diag("ml_inference_failed"); logging.exception("ML INFERENCE FAILED | %s", symbol); return None
-
-    def _amount(self, symbol, value):
-        return float(self.c.amount_to_precision(symbol, value))
-
-    def _native_trading_stop(self, p, price, qty, tp_price):
-        symbol = self.c.market(p.symbol).get("id") or p.symbol.replace("/", "").replace(":USDT", "")
-        params = {"category": "linear", "symbol": symbol, "positionIdx": 0, "tpslMode": "Partial", "takeProfit": str(tp_price), "stopLoss": str(p.stop), "tpSize": str(qty), "slSize": str(qty), "tpOrderType": "Market", "slOrderType": "Market", "tpTriggerBy": "MarkPrice", "slTriggerBy": "MarkPrice"}
-        if p.side == "long" and not (tp_price > price and p.stop < price): raise RuntimeError(f"invalid LONG protection prices entry={price} tp={tp_price} sl={p.stop}")
-        if p.side == "short" and not (tp_price < price and p.stop > price): raise RuntimeError(f"invalid SHORT protection prices entry={price} tp={tp_price} sl={p.stop}")
-        return self.c.request("v5/position/trading-stop", "private", "POST", params)
-
-    def _protect(self, p):
-        q1 = float(os.getenv("TP1_CLOSE_PCT", "0.35")); q2 = float(os.getenv("TP2_CLOSE_PCT", "0.35")); q3 = max(0.0, 1.0 - q1 - q2)
-        fractions = [("TP1", p.tp1, q1), ("TP2", p.tp2, q2), ("TP3", p.tp3, q3)]
-        orders = []
-        for name, tp, fraction in fractions:
-            qty = _amount(self, p.symbol, p.qty * fraction)
-            if qty <= 0: continue
-            response = _native_trading_stop(self, p, p.entry, qty, tp)
-            if not isinstance(response, dict) or response.get("retCode", 0) != 0: raise RuntimeError(f"Bybit trading-stop failed: {response}")
-            orders.append((name, qty, response.get("retCode")))
-            logging.info("PROTECTION SET | symbol=%s | %s qty=%s tp=%s sl=%s", p.symbol, name, qty, tp, p.stop)
-        if len(orders) != 3: raise RuntimeError(f"protection incomplete: {orders}")
-        logging.info("PROTECTION VERIFIED | symbol=%s | side=%s | SL=%s | TP1=%s | TP2=%s | TP3=%s | mode=BybitPartial", p.symbol, p.side, p.stop, p.tp1, p.tp2, p.tp3)
-        self.journal("protection", p, {"exchange_orders": orders, "mode": "bybit_trading_stop_partial"})
-
-    def _open_with_protection(self, s):
-        before = set(self.pos); _original_open(self, s)
-        if s.symbol not in self.pos or s.symbol in before: return
-        p = self.pos[s.symbol]
-        try: _protect(self, p)
-        except Exception:
-            logging.exception("PROTECTION FAILED | symbol=%s | closing immediately", p.symbol)
+            logging.exception('PROTECTION FAILED | symbol=%s | closing immediately',p.symbol)
             try:
-                q = _amount(self, p.symbol, p.qty)
-                if q > 0: self.c.create_order(p.symbol, "market", "sell" if p.side == "long" else "buy", q, None, {"reduceOnly": True, "positionIdx": 0})
-            finally: self.pos.pop(s.symbol, None)
+                q=float(self.c.amount_to_precision(p.symbol,p.qty));
+                if q>0:self.c.create_order(p.symbol,'market','sell' if p.side=='long' else 'buy',q,None,{'reduceOnly':True,'positionIdx':0})
+            finally:self.pos.pop(s.symbol,None)
             raise
-
-    def _exchange_managed_only(self):
-        return
-
-    advanced_engine.Engine.__init__ = _patched_init
-    advanced_engine.Engine.signal = _patched_signal
-    advanced_engine.Engine.open = _open_with_protection
-    advanced_engine.Engine.manage = _exchange_managed_only
-    logging.info("RUNTIME PATCH | ML fail-closed + Bybit native partial TP/SL enabled")
+    advanced_engine.Engine.__init__=_patched_init; advanced_engine.Engine.ohlcv=_ws_ohlcv; advanced_engine.Engine.flow=_ws_flow; advanced_engine.Engine.book=_ws_book; advanced_engine.Engine.signal=_patched_signal; advanced_engine.Engine.open=_open_with_protection; advanced_engine.Engine.manage=lambda self:None
+    logging.info('RUNTIME PATCH | WS market data + ML fail-closed + TP1/TP2 + exchange trailing runner')
