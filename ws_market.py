@@ -8,7 +8,7 @@ class BybitMarketWS:
   self.max_candles=max_candles
   self._lock=threading.RLock();self._ws=None;self._thread=None;self._stop=False
   self._topics=set();self._ready=threading.Event();self._sub_id=0
-  self._last_message=0.0;self._last_connect=0.0;self._reconnect_count=0
+  self._last_message=0.0;self._last_connect=0.0;self._reconnect_count=0;self._last_health_log=0.0
   self.tickers={};self.trades=defaultdict(lambda:deque(maxlen=300));self.books={};self.candles=defaultdict(lambda:deque(maxlen=max_candles));self._seeded=set()
  @staticmethod
  def sym(s):return s.replace('/','').replace(':USDT','')
@@ -16,6 +16,14 @@ class BybitMarketWS:
   if self._thread and self._thread.is_alive():return
   self._stop=False
   self._thread=threading.Thread(target=self._run,daemon=True,name='bybit-market-ws');self._thread.start();self._ready.wait(10)
+  logging.info('WS START RESULT | ready=%s | thread_alive=%s',self._ready.is_set(),self._thread.is_alive())
+ def stop(self):
+  self._stop=True
+  with self._lock:
+   ws=self._ws
+  if ws:
+   try:ws.close()
+   except Exception:logging.exception('WS CLOSE FAILED')
  def _run(self):
   backoff=2
   while not self._stop:
@@ -25,6 +33,7 @@ class BybitMarketWS:
     ws=websocket.WebSocketApp(self.url,on_open=self._on_open,on_message=self._on_message,on_error=self._on_error,on_close=self._on_close)
     self._ws=ws
     ws.run_forever(ping_interval=20,ping_timeout=10,ping_payload='ping')
+    logging.warning('WS RUN_FOREVER RETURNED | stop=%s',self._stop)
    except Exception:logging.exception('WS LOOP FAILED')
    finally:
     with self._lock:self._ws=None
@@ -68,7 +77,9 @@ class BybitMarketWS:
   try:
    with self._lock:
     if t.startswith('tickers.'):
-     z=t.split('.',1)[1];self.tickers[z]=data if isinstance(data,dict) else data[0]
+     z=t.split('.',1)[1];incoming=data if isinstance(data,dict) else data[0]
+     current=self.tickers.get(z,{})
+     current.update(incoming);self.tickers[z]=current
     elif t.startswith('publicTrade.'):
      z=t.split('.',1)[1]
      for x in(data if isinstance(data,list) else[data]):self.trades[z].append(x)
@@ -92,7 +103,12 @@ class BybitMarketWS:
   with self._lock:self._ws=None
   logging.warning('WS CLOSED | code=%s msg=%s',code,msg)
  def is_healthy(self,max_silence=45):
-  with self._lock:return self._ready.is_set() and self._ws is not None and self._last_message>0 and time.time()-self._last_message<=max_silence
+  with self._lock:
+   healthy=self._ready.is_set() and self._ws is not None and self._last_message>0 and time.time()-self._last_message<=max_silence
+   now=time.time()
+   if now-self._last_health_log>=60:
+    self._last_health_log=now;logging.info('WS HEALTH | healthy=%s | age=%.1fs | topics=%s | tickers=%s',healthy,(now-self._last_message) if self._last_message else -1,len(self._topics),len(self.tickers))
+   return healthy
  def ticker_snapshot(self):
   with self._lock:return dict(self.tickers)
  def seed_ohlcv(self,symbol,fetcher,n=120):
