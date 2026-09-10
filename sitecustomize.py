@@ -11,6 +11,10 @@ else:
     _init=advanced_engine.Engine.__init__; _signal=advanced_engine.Engine.signal; _open=advanced_engine.Engine.open
     _ohlcv=advanced_engine.Engine.ohlcv; _flow=advanced_engine.Engine.flow; _book=advanced_engine.Engine.book
     def _path(): return os.getenv('ML_MODEL_PATH','data/models/pump_classifier.joblib')
+    def _notify(self,text):
+        try:
+            if self.alert:self.alert(text)
+        except Exception: logging.exception('ML ALERT FAILED | %s',text)
     def _train(client):
         from sklearn.ensemble import RandomForestClassifier
         from sklearn.model_selection import train_test_split
@@ -40,16 +44,16 @@ else:
             try:
                 if os.path.exists(path):
                     candidate=joblib.load(path); fc=candidate.get('feature_count') if isinstance(candidate,dict) else None
-                    if fc==12: self.ml=candidate
-                    else: logging.warning('ML MODEL INCOMPATIBLE | feature_count=%s expected=12 | retraining',fc)
-            except Exception: logging.exception('ML model load failed; retraining')
+                    if fc==12:self.ml=candidate
+                    else:logging.warning('ML MODEL INCOMPATIBLE | feature_count=%s expected=12 | retraining',fc)
+            except Exception:logging.exception('ML model load failed; retraining')
             if self.ml is None and os.getenv('ML_AUTO_TRAIN','true').lower() in ('1','true','yes','on'):
-                try: _train(client); self.ml=joblib.load(path); logging.info('ML STATUS | enabled=true | loaded=true | source=auto-trained | path=%s',path)
-                except Exception: logging.exception('ML AUTO TRAIN FAILED | trading remains blocked')
-        if self.ml is None: logging.error('ML STATUS | enabled=%s | loaded=false | required=%s | path=%s',enabled,self.ml_required,path)
-        else: logging.info('ML STATUS | enabled=true | loaded=true | auc=%s | path=%s',self.ml.get('auc') if isinstance(self.ml,dict) else 'n/a',path)
+                try:_train(client); self.ml=joblib.load(path); logging.info('ML STATUS | enabled=true | loaded=true | source=auto-trained | path=%s',path)
+                except Exception:logging.exception('ML AUTO TRAIN FAILED | trading remains blocked')
+        if self.ml is None:logging.error('ML STATUS | enabled=%s | loaded=false | required=%s | path=%s',enabled,self.ml_required,path)
+        else:logging.info('ML STATUS | enabled=true | loaded=true | auc=%s | path=%s',self.ml.get('auc') if isinstance(self.ml,dict) else 'n/a',path)
     def _ws_ohlcv(self,s,n=120):
-        if getattr(self,'ws',None): return self.ws.get_ohlcv(s,lambda sym,lim:_ohlcv(self,sym,lim),n)
+        if getattr(self,'ws',None):return self.ws.get_ohlcv(s,lambda sym,lim:_ohlcv(self,sym,lim),n)
         return _ohlcv(self,s,n)
     def _ws_flow(self,s):
         if getattr(self,'ws',None):
@@ -65,28 +69,27 @@ else:
         return _book(self,s,p)
     def _patched_signal(self,symbol):
         saved=self.ml; self.ml=None
-        try: sig=_signal(self,symbol)
-        finally: self.ml=saved
+        try:sig=_signal(self,symbol)
+        finally:self.ml=saved
         if sig is None:return None
-        if self.ml_required and saved is None: self._diag('ml_unavailable'); logging.warning('ML BLOCK | %s | no compatible model',symbol); return None
+        if self.ml_required and saved is None:
+            self._diag('ml_unavailable'); logging.warning('ML BLOCK | %s | no compatible model',symbol); _notify(self,f'🟠 ML BLOCK | {symbol} | model unavailable'); return None
         try:
-            side=1. if sig.side=='long' else -1.; feats=np.asarray([[sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.vwap,sig.move5,sig.atr,sig.m1/100,sig.m3/100,sig.spread,side]],float); model=saved['model'] if isinstance(saved,dict) else saved; prob=float(model.predict_proba(feats)[0,1]); sig.ml_prob=prob; minimum=float(os.getenv('ML_MIN_PROBABILITY','0.58'))
-            if not np.isfinite(prob) or prob<minimum: self._diag('ml_rejected'); logging.info('ML REJECT | %s | probability=%.3f | min=%.3f',symbol,prob,minimum); return None
-            logging.info('ML ACCEPT | %s | side=%s | probability=%.3f',symbol,sig.side,prob); return sig
-        except Exception: self._diag('ml_inference_failed'); logging.exception('ML INFERENCE FAILED | %s',symbol); return None
+            side=1. if sig.side=='long' else -1.; feats=np.asarray([[sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.vwap,sig.move5,sig.atr,sig.m1/100,sig.m3/100,sig.spread,side]],float); model=saved['model'] if isinstance(saved,dict) else saved; logging.info('ML START | %s | side=%s | features=12',symbol,sig.side); prob=float(model.predict_proba(feats)[0,1]); sig.ml_prob=prob; minimum=float(os.getenv('ML_MIN_PROBABILITY','0.58'))
+            if not np.isfinite(prob) or prob<minimum:
+                self._diag('ml_rejected'); logging.info('ML REJECT | %s | probability=%.3f | min=%.3f',symbol,prob,minimum); _notify(self,f'❌ ML REJECT | {symbol} | side={sig.side.upper()} | probability={prob:.3f} | min={minimum:.3f}'); return None
+            logging.info('ML ACCEPT | %s | side=%s | probability=%.3f',symbol,sig.side,prob); _notify(self,f'✅ ML ACCEPT | {symbol} | side={sig.side.upper()} | probability={prob:.3f} | min={minimum:.3f}'); return sig
+        except Exception:
+            self._diag('ml_inference_failed'); logging.exception('ML INFERENCE FAILED | %s',symbol); _notify(self,f'🔴 ML INFERENCE FAILED | {symbol}'); return None
     def _protect(self,p):
-        def req(params):
-            return self.c.request('v5/position/trading-stop','private','POST',params)
+        def req(params):return self.c.request('v5/position/trading-stop','private','POST',params)
         symbol=self.c.market(p.symbol).get('id') or p.symbol.replace('/','').replace(':USDT',''); q1=float(os.getenv('TP1_CLOSE_PCT','.35')); q2=float(os.getenv('TP2_CLOSE_PCT','.35')); q3=max(0,1-q1-q2)
         for name,tp,f in [('TP1',p.tp1,q1),('TP2',p.tp2,q2)]:
             qty=float(self.c.amount_to_precision(p.symbol,p.qty*f)); params={'category':'linear','symbol':symbol,'positionIdx':0,'tpslMode':'Partial','takeProfit':str(tp),'stopLoss':str(p.stop),'tpSize':str(qty),'slSize':str(qty),'tpOrderType':'Market','slOrderType':'Market','tpTriggerBy':'MarkPrice','slTriggerBy':'MarkPrice'}; r=req(params)
-            if not isinstance(r,dict) or r.get('retCode',0)!=0: raise RuntimeError(f'Bybit TP/SL failed: {r}')
+            if not isinstance(r,dict) or r.get('retCode',0)!=0:raise RuntimeError(f'Bybit TP/SL failed: {r}')
             logging.info('PROTECTION SET | %s | %s qty=%s tp=%s sl=%s',p.symbol,name,qty,tp,p.stop)
         if q3>0:
-            qty=float(self.c.amount_to_precision(p.symbol,p.qty*q3)); distance=float(p.risk)*float(os.getenv('TRAILING_ATR_MULT','1.5')); active=p.tp2
-            side='sell' if p.side=='long' else 'buy'; params={'category':'linear','symbol':symbol,'positionIdx':0,'side':side,'orderType':'Market','qty':str(qty),'triggerDirection':1 if p.side=='long' else 2,'triggerPrice':str(active),'triggerBy':'MarkPrice','stopOrderType':'TrailingStop','trailingStop':str(distance),'reduceOnly':True,'closeOnTrigger':True}
-            r=self.c.create_order(p.symbol,'market',side,qty,None,params)
-            logging.info('RUNNER TRAILING SET | %s | qty=%s | activation=%s | distance=%s | order=%s',p.symbol,qty,active,distance,r.get('id'))
+            qty=float(self.c.amount_to_precision(p.symbol,p.qty*q3)); distance=float(p.risk)*float(os.getenv('TRAILING_ATR_MULT','1.5')); active=p.tp2; side='sell' if p.side=='long' else 'buy'; params={'category':'linear','symbol':symbol,'positionIdx':0,'side':side,'orderType':'Market','qty':str(qty),'triggerDirection':1 if p.side=='long' else 2,'triggerPrice':str(active),'triggerBy':'MarkPrice','stopOrderType':'TrailingStop','trailingStop':str(distance),'reduceOnly':True,'closeOnTrigger':True}; r=self.c.create_order(p.symbol,'market',side,qty,None,params); logging.info('RUNNER TRAILING SET | %s | qty=%s | activation=%s | distance=%s | order=%s',p.symbol,qty,active,distance,r.get('id'))
         self.journal('protection',p,{'mode':'TP1+TP2+exchange_trailing_runner','runner_fraction':q3})
     def _open_with_protection(self,s):
         before=set(self.pos); _open(self,s)
@@ -101,4 +104,4 @@ else:
             finally:self.pos.pop(s.symbol,None)
             raise
     advanced_engine.Engine.__init__=_patched_init; advanced_engine.Engine.ohlcv=_ws_ohlcv; advanced_engine.Engine.flow=_ws_flow; advanced_engine.Engine.book=_ws_book; advanced_engine.Engine.signal=_patched_signal; advanced_engine.Engine.open=_open_with_protection; advanced_engine.Engine.manage=lambda self:None
-    logging.info('RUNTIME PATCH | WS market data + ML fail-closed + TP1/TP2 + exchange trailing runner')
+    logging.info('RUNTIME PATCH | WS market data + ML fail-closed + ML alerts + TP1/TP2 + exchange trailing runner')
