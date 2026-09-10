@@ -12,187 +12,119 @@ except Exception:
     RateLimitExceeded = Exception
     BadRequest = Exception
 
-F = lambda k, d: float(os.getenv(k, d))
-I = lambda k, d: int(os.getenv(k, d))
-B = lambda k, d: os.getenv(k, str(d)).lower() in ('1', 'true', 'yes', 'on')
+F=lambda k,d: float(os.getenv(k,d))
+I=lambda k,d: int(os.getenv(k,d))
+B=lambda k,d: os.getenv(k,str(d)).lower() in ('1','true','yes','on')
 
 @dataclass
 class Signal:
-    symbol: str; side: str; price: float; atr: float; rsi: float; vol: float; flow: float; book: float; vwap: float; move5: float; score: float; reason: str; m1: float = 0.; m3: float = 0.; spread: float = 0.; ml_prob: float = 0.
-
+    symbol:str; side:str; price:float; atr:float; rsi:float; vol:float; flow:float; book:float; vwap:float; move5:float; score:float; reason:str; m1:float=0.; m3:float=0.; spread:float=0.; ml_prob:float=0.
 @dataclass
 class Position:
-    symbol: str; side: str; entry: float; qty: float; stop: float; tp1: float; tp2: float; tp3: float; risk: float; remaining: float = 1.; tp1_done: bool = False; tp2_done: bool = False
+    symbol:str; side:str; entry:float; qty:float; stop:float; tp1:float; tp2:float; tp3:float; risk:float; remaining:float=1.; tp1_done:bool=False; tp2_done:bool=False
 
 class Engine:
-    def __init__(self, client, alert=None):
-        self.c = client; self.alert = alert; self.pos = {}; self.realized = 0.; self.losses = 0; self.halted = False
-        self.day = time.strftime('%Y-%m-%d', time.gmtime()); self.day_start = None; self.pending = {}
-        self.flow_cache = {}; self.book_cache = {}; self.flow_book_ttl = max(5, I('PUMP_FLOW_BOOK_CACHE_SEC', 20)); self.diag = {}
-        self.vol = F('PUMP_VOL_SPIKE_MULT', 3); self.minvol = F('PUMP_MIN_DOLLAR_VOL', 5e6); self.m1 = F('PUMP_MIN_1M_MOVE_PCT', .006); self.m3 = F('PUMP_MIN_3M_MOVE_PCT', .012); self.m5 = F('PUMP_MAX_5M_MOVE_PCT', .045); self.brk = I('PUMP_BREAKOUT_LOOKBACK', 10)
-        self.rmin = F('PUMP_MIN_RSI_ENTRY', 52); self.rmax = F('PUMP_MAX_RSI_ENTRY', 78); self.flowmin = F('PUMP_MIN_BUY_RATIO', .58); self.bookmin = F('PUMP_MIN_BOOK_IMBALANCE', .56); self.spread = F('MAX_SPREAD_PCT', .15); self.depth = F('ORDERBOOK_DEPTH_PCT', 1)
-        self.risk = F('MAX_RISK_PER_TRADE_PCT', .5) / 100; self.dayloss = F('MAX_DAILY_LOSS_PCT', 2) / 100; self.maxloss = I('MAX_CONSECUTIVE_LOSSES', 3); self.maxpos = I('PUMP_MAX_POSITIONS', 2); self.lev = I('PUMP_LEVERAGE', 2)
-        self.tp1 = F('TP1_R', 1); self.tp2 = F('TP2_R', 2); self.tp3 = F('TP3_R', 3.5); self.tq1 = F('TP1_CLOSE_PCT', .35); self.tq2 = F('TP2_CLOSE_PCT', .35); self.trail = F('TRAILING_ATR_MULT', 1.5); self.sl = F('PUMP_SL_ATR_MULT', 1.5); self.ssl = F('SHORT_SL_ATR_MULT', 1.5)
-        self.confirm = max(1, I('SIGNAL_CONFIRM_CYCLES', 2))
-        self.ml = None; self.ml_min = F('ML_MIN_PROBABILITY', .62)
-        model_path = os.getenv('ML_MODEL_PATH', 'models/pump_classifier.joblib')
-        if B('ML_ENABLED', True) and joblib and os.path.exists(model_path):
-            try: self.ml = joblib.load(model_path)
-            except Exception: logging.exception('ML model load failed')
-
-    def _diag(self, key):
-        self.diag[key] = self.diag.get(key, 0) + 1
-    def ohlcv(self, s, n=120):
-        return self.c.fetch_ohlcv(s, timeframe=os.getenv('PUMP_TIMEFRAME', '1m'), limit=n)
-    def rsi(self, c, n=14):
+    def __init__(self,client,alert=None):
+        self.c=client; self.alert=alert; self.pos={}; self.realized=0.; self.losses=0; self.halted=False
+        self.day=time.strftime('%Y-%m-%d',time.gmtime()); self.day_start=None; self.pending={}; self.flow_cache={}; self.book_cache={}; self.flow_book_ttl=max(5,I('PUMP_FLOW_BOOK_CACHE_SEC',20)); self.diag={}
+        self.vol=F('PUMP_VOL_SPIKE_MULT',2.2); self.minvol=F('PUMP_MIN_DOLLAR_VOL',5e6); self.m1=F('PUMP_MIN_1M_MOVE_PCT',.004); self.m3=F('PUMP_MIN_3M_MOVE_PCT',.008); self.m5=F('PUMP_MAX_5M_MOVE_PCT',.060); self.brk=I('PUMP_BREAKOUT_LOOKBACK',10)
+        self.rmin=F('PUMP_MIN_RSI_ENTRY',52); self.rmax=F('PUMP_MAX_RSI_ENTRY',80); self.flowmin=F('PUMP_MIN_BUY_RATIO',.56); self.bookmin=F('PUMP_MIN_BOOK_IMBALANCE',.54); self.spread=F('MAX_SPREAD_PCT',.15); self.depth=F('ORDERBOOK_DEPTH_PCT',1)
+        self.risk=F('MAX_RISK_PER_TRADE_PCT',.5)/100; self.dayloss=F('MAX_DAILY_LOSS_PCT',2)/100; self.maxloss=I('MAX_CONSECUTIVE_LOSSES',3); self.maxpos=I('PUMP_MAX_POSITIONS',2); self.lev=I('PUMP_LEVERAGE',2)
+        self.tp1=F('TP1_R',1); self.tp2=F('TP2_R',2); self.tp3=F('TP3_R',3.5); self.tq1=F('TP1_CLOSE_PCT',.35); self.tq2=F('TP2_CLOSE_PCT',.35); self.trail=F('TRAILING_ATR_MULT',1.5); self.sl=F('PUMP_SL_ATR_MULT',1.8); self.ssl=F('SHORT_SL_ATR_MULT',1.5)
+        self.confirm=max(1,I('SIGNAL_CONFIRM_CYCLES',2)); self.ml=None; self.ml_min=F('ML_MIN_PROBABILITY',.58)
+        path=os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib')
+        if B('ML_ENABLED',True) and joblib and os.path.exists(path):
+            try:self.ml=joblib.load(path)
+            except Exception:logging.exception('ML model load failed')
+    def _diag(self,k): self.diag[k]=self.diag.get(k,0)+1
+    def ohlcv(self,s,n=120): return self.c.fetch_ohlcv(s,timeframe=os.getenv('PUMP_TIMEFRAME','1m'),limit=n)
+    def rsi(self,c,n=14):
         d=np.diff(c); g=np.maximum(d,0); l=np.maximum(-d,0); ag=g[:n].mean(); al=l[:n].mean()
         for i in range(n,len(d)): ag=(ag*(n-1)+g[i])/n; al=(al*(n-1)+l[i])/n
         return 100 if al<=1e-12 else 100-100/(1+ag/al)
-    def atr(self, x, n=14):
-        h=np.array([z[2] for z in x]); l=np.array([z[3] for z in x]); c=np.array([z[4] for z in x]); pc=c[:-1]
-        tr=np.maximum(h[1:]-l[1:], np.maximum(abs(h[1:]-pc), abs(l[1:]-pc))); return float(tr[-n:].mean())
-    def flow(self, s):
+    def atr(self,x,n=14):
+        h=np.array([z[2] for z in x]); l=np.array([z[3] for z in x]); c=np.array([z[4] for z in x]); pc=c[:-1]; tr=np.maximum(h[1:]-l[1:],np.maximum(abs(h[1:]-pc),abs(l[1:]-pc))); return float(tr[-n:].mean())
+    def flow(self,s):
         now=time.time(); hit=self.flow_cache.get(s)
-        if hit and now-hit[0] < self.flow_book_ttl: return hit[1]
-        try: t=self.c.fetch_trades(s, limit=100)
-        except RateLimitExceeded: raise
-        except Exception:
-            self._diag('flow_fetch_failed'); return .5
+        if hit and now-hit[0]<self.flow_book_ttl:return hit[1]
+        try:t=self.c.fetch_trades(s,limit=100)
+        except RateLimitExceeded:raise
+        except Exception:self._diag('flow_fetch_failed');return .5
         b=sum(float(x.get('amount') or 0) for x in t if str(x.get('side')).lower()=='buy'); a=sum(float(x.get('amount') or 0) for x in t if str(x.get('side')).lower()=='sell'); v=b/max(a+b,1e-12); self.flow_cache[s]=(now,v); return v
-    def book(self, s, p):
+    def book(self,s,p):
         now=time.time(); hit=self.book_cache.get(s)
-        if hit and now-hit[0] < self.flow_book_ttl: return hit[1], hit[2]
+        if hit and now-hit[0]<self.flow_book_ttl:return hit[1],hit[2]
         try:
             o=self.c.fetch_order_book(s,limit=50); b=sum(float(q)*float(px) for px,q in o.get('bids',[]) if float(px)>=p*(1-self.depth/100)); a=sum(float(q)*float(px) for px,q in o.get('asks',[]) if float(px)<=p*(1+self.depth/100)); bid=o.get('bids',[[p,0]])[0][0]; ask=o.get('asks',[[p,0]])[0][0]; v=b/max(a+b,1e-12); sp=(ask-bid)/p*100; self.book_cache[s]=(now,v,sp); return v,sp
-        except RateLimitExceeded: raise
-        except Exception:
-            self._diag('book_fetch_failed'); return .5,999
-    def signal(self, s):
+        except RateLimitExceeded:raise
+        except Exception:self._diag('book_fetch_failed');return .5,999
+    def signal(self,s):
         x=self.ohlcv(s)
-        if len(x) < 30:
-            self._diag('insufficient_ohlcv'); return None
+        if len(x)<30:self._diag('insufficient_ohlcv');return None
         c=np.array([z[4] for z in x],float); o=np.array([z[1] for z in x]); v=np.array([z[5] for z in x]); p=float(c[-1]); a=self.atr(x); r=self.rsi(c); vr=v[-1]/max(v[-21:-1].mean(),1e-12); m1=c[-1]/c[-2]-1; m3=c[-1]/c[-4]-1; m5=c[-1]/c[-6]-1
-        vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12); vd=abs(p/vw-1)*100; green=sum(c[-2:] > o[-2:]); br=p>=max(c[-self.brk-1:-1])
-        failed=max(c[-6:])>=max(c[-self.brk-2:-2]) and p<c[-2]
-
-        long_checks = {
-            'breakout': br,
-            'm1': m1 >= self.m1,
-            'm3': m3 >= self.m3,
-            'm5_cap': m5 <= self.m5,
-            'volume': vr >= self.vol,
-            'green_2': green >= 2,
-            'rsi': self.rmin <= r <= self.rmax,
-            'vwap_distance': vd <= F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',4.5),
-        }
-        short_checks = {
-            'move5': m5 >= F('PUMP_MAX_ENTRY_5M_MOVE_PCT',4.5)/100,
-            'volume': vr >= self.vol*.8,
-            'failed_breakout': failed,
-            'rsi': r >= F('PUMP_DUMP_MAX_RSI',72),
-        }
-        pre_long = all(long_checks.values()); pre_short = all(short_checks.values())
-        for k,vv in long_checks.items():
-            if not vv: self._diag(f'long_fail_{k}')
+        vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12); vd=abs(p/vw-1)*100; green=sum(c[-2:] > o[-2:]); br=p>=max(c[-self.brk-1:-1]); failed=max(c[-6:])>=max(c[-self.brk-2:-2]) and p<c[-2]
+        checks={'breakout':br,'m1':m1>=self.m1,'m3':m3>=self.m3,'volume':vr>=self.vol,'green_2':green>=2}
+        momentum=sum(bool(z) for z in checks.values())
+        # Relaxed candidate gate: require 3/5 momentum signals, while keeping RSI/VWAP/5m cap strict.
+        pre_long=momentum>=3 and m5<=self.m5 and self.rmin<=r<=self.rmax and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',5.0)
+        short_checks={'move5':m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',3.0)/100,'volume':vr>=self.vol*.8,'failed_breakout':failed,'rsi':r>=F('PUMP_DUMP_MAX_RSI',72)}
+        pre_short=sum(bool(z) for z in short_checks.values())>=3
+        for k,vv in checks.items():
+            if not vv:self._diag(f'long_fail_{k}')
         for k,vv in short_checks.items():
-            if not vv: self._diag(f'short_fail_{k}')
-        if not pre_long: self._diag('long_core_failed')
-        if not pre_short: self._diag('short_core_failed')
-        if not (pre_long or pre_short):
-            self._diag('no_core_candidate'); return None
-
+            if not vv:self._diag(f'short_fail_{k}')
+        if not pre_long:self._diag('long_core_failed')
+        if not pre_short:self._diag('short_core_failed')
+        if not(pre_long or pre_short):self._diag('no_core_candidate');return None
         book,sp=self.book(s,p)
-        if sp>self.spread:
-            self._diag('spread_failed'); return None
-        long_book = book>=self.bookmin; short_book = book<=1-self.bookmin
-        if not (long_book or short_book):
-            self._diag('book_imbalance_failed'); return None
-        flow=self.flow(s)
-        long = pre_long and flow>=self.flowmin and long_book
-        short = pre_short and flow<=F('PUMP_DUMP_MIN_SELL_RATIO',.55) and short_book
-        if not long: self._diag('long_flow_or_book_failed')
-        if not short: self._diag('short_flow_or_book_failed')
-        if long and short:
-            logging.warning('SIGNAL CONFLICT | %s | LONG and SHORT conditions both true; rejecting', s); self._diag('signal_conflict'); return None
-        if not (long or short): self._diag('flow_filter_failed'); return None
-
-        side='long' if long else 'short'; q=flow if long else 1-flow; bi=book if long else 1-book
-        score=min(.3*min(vr/5,1)+.2*min(abs(m5)/.05,1)+.25*q+.15*max((bi-.5)*2,0)+.1,1); mlp=0.
-        if self.ml:
-            try:
-                feats=np.asarray([[score,r,vr,flow,book,vd,m5*100,a,m1,m3,sp]],float); mlp=float(self.ml['model'].predict_proba(feats)[0,1]);
-                if mlp<self.ml_min: self._diag('ml_rejected'); return None
-            except Exception: self._diag('ml_inference_failed'); logging.exception('ML inference failed for %s', s)
-        return Signal(s,side,p,a,r,vr,flow,book,vd,m5*100,score,'continuation' if long else 'exhaustion',m1*100,m3*100,sp,mlp)
+        if sp>self.spread:self._diag('spread_failed');return None
+        long_book=book>=self.bookmin; short_book=book<=1-self.bookmin
+        if not(long_book or short_book):self._diag('book_imbalance_failed');return None
+        flow=self.flow(s); long=pre_long and flow>=self.flowmin and long_book; short=pre_short and flow<=F('PUMP_DUMP_MIN_SELL_RATIO',.55) and short_book
+        if not long:self._diag('long_flow_or_book_failed')
+        if not short:self._diag('short_flow_or_book_failed')
+        if long and short:self._diag('signal_conflict');logging.warning('SIGNAL CONFLICT | %s',s);return None
+        if not(long or short):self._diag('flow_filter_failed');return None
+        side='long' if long else 'short'; q=flow if long else 1-flow; bi=book if long else 1-book; score=min(.3*min(vr/5,1)+.2*min(abs(m5)/.05,1)+.25*q+.15*max((bi-.5)*2,0)+.1,1)
+        return Signal(s,side,p,a,r,vr,flow,book,vd,m5*100,score,'continuation' if long else 'exhaustion',m1*100,m3*100,sp,0.)
     def equity(self):
-        try: b=self.c.fetch_balance({'type':'swap'}); return float((b.get('total') or {}).get('USDT') or (b.get('USDT') or {}).get('total') or 0)
-        except Exception: return 0
-    def open(self, s):
-        if len(self.pos)>=self.maxpos or s.symbol in self.pos: return
+        try:b=self.c.fetch_balance({'type':'swap'});return float((b.get('total') or {}).get('USDT') or (b.get('USDT') or {}).get('total') or 0)
+        except Exception:return 0
+    def open(self,s):
+        if len(self.pos)>=self.maxpos or s.symbol in self.pos:return
         e=self.equity(); d=s.atr*(self.ssl if s.side=='short' else self.sl); q=e*self.risk/d if e and d else 0; m=self.c.market(s.symbol); amin=float(((m.get('limits',{}).get('amount') or {}).get('min')) or 0); q=float(self.c.amount_to_precision(s.symbol,max(q,amin)))
-        if q<=0: return
-        order_side = 'buy' if s.side=='long' else 'sell'
-        logging.info('ORDER INTENT | signal=%s | order_side=%s | symbol=%s | qty=%s', s.side, order_side, s.symbol, q)
-        if (s.side=='long') != (order_side=='buy'):
-            raise RuntimeError(f'order-side mismatch for {s.symbol}: signal={s.side} order={order_side}')
-        try:
-            self.c.set_leverage(self.lev,s.symbol)
+        if q<=0:return
+        side='buy' if s.side=='long' else 'sell'; logging.info('ORDER INTENT | signal=%s | order_side=%s | symbol=%s | qty=%s',s.side,side,s.symbol,q)
+        try:self.c.set_leverage(self.lev,s.symbol)
         except BadRequest as e:
-            if '110043' not in str(e):
-                raise
-            logging.info('LEVERAGE UNCHANGED | symbol=%s | leverage=%s | continuing to order', s.symbol, self.lev)
-        try:
-            o=self.c.create_order(s.symbol,'market',order_side,q,None,{'positionIdx':0})
-        except Exception:
-            logging.exception('ORDER FAILED | symbol=%s | side=%s | qty=%s', s.symbol, order_side, q)
-            raise
-        logging.info('ORDER EXECUTED | symbol=%s | side=%s | qty=%s | id=%s | status=%s', s.symbol, order_side, q, o.get('id'), o.get('status'))
-        en=float(o.get('average') or o.get('price') or s.price); sg=1 if s.side=='long' else -1; stop=en-sg*d; t1=en+sg*d*self.tp1; t2=en+sg*d*self.tp2; t3=en+sg*d*self.tp3; self.pos[s.symbol]=Position(s.symbol,s.side,en,q,stop,t1,t2,t3,d); self.journal('open',self.pos[s.symbol],{'signal':asdict(s),'order_side':order_side,'order_id':o.get('id')})
+            if '110043' not in str(e):raise
+            logging.info('LEVERAGE UNCHANGED | symbol=%s | leverage=%s',s.symbol,self.lev)
+        o=self.c.create_order(s.symbol,'market',side,q,None,{'positionIdx':0}); logging.info('ORDER EXECUTED | symbol=%s | side=%s | qty=%s | id=%s',s.symbol,side,q,o.get('id'))
+        en=float(o.get('average') or o.get('price') or s.price); sg=1 if s.side=='long' else -1; stop=en-sg*d; t1=en+sg*d*self.tp1; t2=en+sg*d*self.tp2; t3=en+sg*d*self.tp3; self.pos[s.symbol]=Position(s.symbol,s.side,en,q,stop,t1,t2,t3,d); self.journal('open',self.pos[s.symbol],{'signal':asdict(s),'order_id':o.get('id')})
     def journal(self,event,p,extra=None):
         path=os.getenv('TRADE_JOURNAL_PATH','data/trades.jsonl'); os.makedirs(os.path.dirname(path) or '.',exist_ok=True); open(path,'a',encoding='utf8').write(json.dumps({'ts':time.time(),'event':event,'position':asdict(p),**(extra or {})},default=str)+'\n')
-    def manage(self):
-        for s,p in list(self.pos.items()):
-            try: px=float(self.c.fetch_ticker(s)['last']); sg=1 if p.side=='long' else -1
-            except RateLimitExceeded: raise
-            except Exception: continue
-            if (sg==1 and px<=p.stop) or (sg==-1 and px>=p.stop): self.close(p,'SL'); continue
-            if not p.tp1_done and ((sg==1 and px>=p.tp1) or (sg==-1 and px<=p.tp1)): self.partial(p,self.tq1,'TP1'); p.tp1_done=True
-            if not p.tp2_done and ((sg==1 and px>=p.tp2) or (sg==-1 and px<=p.tp2)): self.partial(p,self.tq2,'TP2'); p.tp2_done=True
-            if p.tp2_done:
-                a=self.atr(self.ohlcv(s,40)); p.stop=max(p.stop,px-a*self.trail) if sg==1 else min(p.stop,px+a*self.trail)
-            if (sg==1 and px>=p.tp3) or (sg==-1 and px<=p.tp3): self.close(p,'TP3')
     def partial(self,p,f,reason):
         q=float(self.c.amount_to_precision(p.symbol,p.qty*f))
-        if q<=0: return
-        self.c.create_order(p.symbol,'market','sell' if p.side=='long' else 'buy',q,None,{'reduceOnly':True,'positionIdx':0}); p.remaining-=f; self.journal(reason.lower(),p,{'qty':q})
+        if q>0:self.c.create_order(p.symbol,'market','sell' if p.side=='long' else 'buy',q,None,{'reduceOnly':True,'positionIdx':0});p.remaining-=f;self.journal(reason.lower(),p,{'qty':q})
     def close(self,p,reason):
-        q=float(self.c.amount_to_precision(p.symbol,p.qty*p.remaining));
-        if q>0: self.c.create_order(p.symbol,'market','sell' if p.side=='long' else 'buy',q,None,{'reduceOnly':True,'positionIdx':0})
-        try: px=float(self.c.fetch_ticker(p.symbol)['last']); pnl=(px-p.entry)*p.qty*(1 if p.side=='long' else -1)
-        except Exception: pnl=0
-        self.realized+=pnl; self.losses=self.losses+1 if pnl<0 else 0; self.journal('close',p,{'reason':reason,'pnl':pnl}); self.pos.pop(p.symbol,None)
+        q=float(self.c.amount_to_precision(p.symbol,p.qty*p.remaining))
+        if q>0:self.c.create_order(p.symbol,'market','sell' if p.side=='long' else 'buy',q,None,{'reduceOnly':True,'positionIdx':0})
+        try:px=float(self.c.fetch_ticker(p.symbol)['last']);pnl=(px-p.entry)*p.qty*(1 if p.side=='long' else -1)
+        except Exception:pnl=0
+        self.realized+=pnl;self.losses=self.losses+1 if pnl<0 else 0;self.journal('close',p,{'reason':reason,'pnl':pnl});self.pos.pop(p.symbol,None)
+    def manage(self):pass
     def run(self,symbols):
-        signals=0; errors=0; self.diag={}
+        signals=0;errors=0;self.diag={}
         for s in symbols:
             try:
                 sig=self.signal(s)
-                if not sig:
-                    self.pending.pop(s,None); continue
-                signals+=1
-                logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
-                state=self.pending.get(s); count=(state[1]+1) if state and state[0]==sig.side else 1; self.pending[s]=(sig.side,count)
-                logging.info('CONFIRM | %s %s %d/%d',sig.side.upper(),s,count,self.confirm)
-                if self.alert: self.alert(f"🚨 {sig.side.upper()} {s} score={sig.score:.2f} CONF={count}/{self.confirm} ML={sig.ml_prob:.2f}")
-                if count>=self.confirm and B('TRADING_ENABLED',False) and os.getenv('PUMP_MODE','alerts')=='trading' and s not in self.pos:
-                    self.open(sig); self.pending.pop(s,None)
-            except RateLimitExceeded:
-                errors+=1; self._diag('rate_limit_exceeded'); logging.error('RATE LIMIT | %s | ending scan cycle early',s); break
-            except Exception:
-                errors+=1; self._diag('unexpected_scan_error'); logging.exception('signal scan failed for %s',s)
-        if B('TRADING_ENABLED',False):
-            try: self.manage()
-            except RateLimitExceeded:
-                errors+=1; self._diag('rate_limit_exceeded_manage'); logging.error('RATE LIMIT | manage | skipping position management this cycle')
-        top=sorted(self.diag.items(), key=lambda kv: kv[1], reverse=True)[:12]
-        if top: logging.info('FILTER DIAGNOSTICS | %s', ' | '.join(f'{k}={v}' for k,v in top))
+                if not sig:self.pending.pop(s,None);continue
+                signals+=1;logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
+                state=self.pending.get(s);count=(state[1]+1) if state and state[0]==sig.side else 1;self.pending[s]=(sig.side,count);logging.info('CONFIRM | %s %s %d/%d',sig.side.upper(),s,count,self.confirm)
+                if self.alert:self.alert(f'🚨 {sig.side.upper()} {s} score={sig.score:.2f} CONF={count}/{self.confirm} ML=waiting')
+                if count>=self.confirm and B('TRADING_ENABLED',False) and os.getenv('PUMP_MODE','alerts')=='trading' and s not in self.pos:self.open(sig);self.pending.pop(s,None)
+            except RateLimitExceeded:errors+=1;self._diag('rate_limit_exceeded');logging.error('RATE LIMIT | %s | ending scan cycle early',s);break
+            except Exception:errors+=1;self._diag('unexpected_scan_error');logging.exception('signal scan failed for %s',s)
+        top=sorted(self.diag.items(),key=lambda kv:kv[1],reverse=True)[:14]
+        if top:logging.info('FILTER DIAGNOSTICS | %s',' | '.join(f'{k}={v}' for k,v in top))
         return {'signals':signals,'errors':errors}
