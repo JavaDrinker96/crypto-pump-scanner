@@ -62,7 +62,6 @@ def main():
     logging.info('DeepAlpha ONLINE | pairs=%s | mode=%s | testnet=%s',len(symbols),mode,TESTNET)
     engine=Engine(x,alert);scan_limit=max(10,int(os.getenv('PUMP_MAX_SCAN_SYMBOLS','40')));interval=max(5,int(os.getenv('PUMP_SCAN_INTERVAL','15')));minvol=float(os.getenv('PUMP_MIN_DOLLAR_VOL','5000000'))
     logging.info('SCANNER CONFIG | scan_limit=%s | interval=%ss | min_dollar_vol=%s',scan_limit,interval,minvol)
-    last_heartbeat=0.0
     while True:
         loop_started=time.time()
         try:
@@ -82,10 +81,6 @@ def main():
             stats=engine.run(selected)
             elapsed=time.time()-loop_started
             logging.info('SCAN RESULT | signals=%s | errors=%s | elapsed=%.1fs',stats.get('signals',0),stats.get('errors',0),elapsed)
-            now=time.time()
-            if now-last_heartbeat>=300:
-                alert(f'💓 <b>DeepAlpha heartbeat</b>\nScans OK\nSignals: {stats.get("signals",0)}\nErrors: {stats.get("errors",0)}')
-                last_heartbeat=now
         except Exception:
             logging.exception('SCANNER LOOP FAILED | elapsed=%.1fs',time.time()-loop_started)
             alert('🔴 <b>DeepAlpha scanner error</b>\nSee Railway logs for traceback.')
