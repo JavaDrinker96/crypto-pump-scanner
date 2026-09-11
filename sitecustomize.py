@@ -17,7 +17,6 @@ else:
         except Exception: logging.exception('ML ALERT FAILED | %s',text)
     def _train(client):
         from sklearn.ensemble import RandomForestClassifier
-        from sklearn.model_selection import train_test_split
         from sklearn.metrics import roc_auc_score
         symbols=[s.strip() for s in os.getenv('ML_TRAIN_SYMBOLS','BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,DOGE/USDT:USDT,BNB/USDT:USDT').split(',') if s.strip()]
         limit=max(300,int(os.getenv('ML_TRAIN_CANDLES','700'))); threshold=float(os.getenv('ML_LABEL_RETURN_PCT','0.25'))/100; X=[]; y=[]
@@ -35,7 +34,9 @@ else:
                     X.append(base+[1.0]); y.append(int(future>=threshold)); X.append(base+[-1.0]); y.append(int(future<=-threshold))
             except Exception: logging.exception('ML TRAIN | failed for %s',s)
         if len(X)<500 or len(set(y))<2: raise RuntimeError(f'insufficient training data: samples={len(X)} classes={sorted(set(y))}')
-        xa,xb,ya,yb=train_test_split(np.asarray(X,float),np.asarray(y,int),test_size=.25,random_state=42,stratify=y); model=RandomForestClassifier(n_estimators=300,max_depth=8,min_samples_leaf=10,class_weight='balanced_subsample',random_state=42,n_jobs=-1); model.fit(xa,ya); auc=roc_auc_score(yb,model.predict_proba(xb)[:,1]); path=_path(); os.makedirs(os.path.dirname(path) or '.',exist_ok=True); joblib.dump({'model':model,'feature_count':12,'label_threshold':threshold,'symbols':symbols,'auc':auc},path); logging.info('ML TRAINED | samples=%s | positives=%s | auc=%.3f | path=%s',len(y),int(np.sum(y)),auc,path)
+        xa=np.asarray(X,float); ya=np.asarray(y,int); split=max(1,int(len(xa)*.75)); xb=xa[split:]; yb=ya[split:]; xa=xa[:split]; ya=ya[:split]
+        if len(xb)<2 or len(set(yb))<2: raise RuntimeError('time-series validation split has insufficient class diversity')
+        model=RandomForestClassifier(n_estimators=300,max_depth=8,min_samples_leaf=10,class_weight='balanced_subsample',random_state=42,n_jobs=-1); model.fit(xa,ya); auc=roc_auc_score(yb,model.predict_proba(xb)[:,1]); path=_path(); os.makedirs(os.path.dirname(path) or '.',exist_ok=True); joblib.dump({'model':model,'feature_count':12,'label_threshold':threshold,'symbols':symbols,'auc':auc,'validation':'chronological_last_25pct'},path); logging.info('ML TRAINED | samples=%s | positives=%s | train=%s | validation=%s | auc=%.3f | path=%s',len(y),int(np.sum(y)),len(ya),len(yb),auc,path)
     def _patched_init(self,client,alert=None):
         _init(self,client,alert); self.ml_required=os.getenv('ML_REQUIRED','true').lower() in ('1','true','yes','on'); enabled=os.getenv('ML_ENABLED','true').lower() in ('1','true','yes','on'); path=_path(); self.ws=getattr(client,'ws_market',None)
         if self.ws: logging.info('MARKET DATA | Bybit public WebSocket enabled')
@@ -73,9 +74,9 @@ else:
         finally:self.ml=saved
         if sig is None:return None
         if self.ml_required and saved is None:
-            self._diag('ml_unavailable'); logging.warning('ML BLOCK | %s | no compatible model',symbol); return None
+            self._diag('ml_unavailable'); logging.warning('ML BLOCK | %s | no compatible model',symbol); _notify(self,f'🟠 ML BLOCK | {symbol} | no compatible model'); return None
         try:
-            side=1. if sig.side=='long' else -1.; feats=np.asarray([[sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.vwap,sig.move5,sig.atr,sig.m1/100,sig.m3/100,sig.spread,side]],float); model=saved['model'] if isinstance(saved,dict) else saved; logging.info('ML START | %s | side=%s | features=12',symbol); prob=float(model.predict_proba(feats)[0,1]); sig.ml_prob=prob; minimum=float(os.getenv('ML_MIN_PROBABILITY','0.58'))
+            side=1. if sig.side=='long' else -1.; feats=np.asarray([[sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.vwap,sig.move5,sig.atr,sig.m1/100,sig.m3/100,sig.spread,side]],float); model=saved['model'] if isinstance(saved,dict) else saved; logging.info('ML START | %s | side=%s | features=12',symbol,sig.side); prob=float(model.predict_proba(feats)[0,1]); sig.ml_prob=prob; minimum=float(os.getenv('ML_MIN_PROBABILITY','0.58'))
             if not np.isfinite(prob) or prob<minimum:
                 self._diag('ml_rejected'); logging.info('ML REJECT | %s | probability=%.3f | min=%.3f',symbol,prob,minimum); return None
             logging.info('ML ACCEPT | %s | side=%s | probability=%.3f',symbol,sig.side,prob); _notify(self,f'✅ ML ACCEPT | {symbol} | side={sig.side.upper()} | probability={prob:.3f} | min={minimum:.3f}'); return sig
