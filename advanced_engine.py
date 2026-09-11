@@ -27,7 +27,7 @@ class Engine:
     def __init__(self,client,alert=None):
         self.c=client; self.alert=alert; self.pos={}; self.realized=0.; self.losses=0; self.halted=False
         self.day=time.strftime('%Y-%m-%d',time.gmtime()); self.day_start=None; self.pending={}; self.flow_cache={}; self.book_cache={}; self.flow_book_ttl=max(5,I('PUMP_FLOW_BOOK_CACHE_SEC',20)); self.diag={}
-        self.vol=F('PUMP_VOL_SPIKE_MULT',2.2); self.minvol=F('PUMP_MIN_DOLLAR_VOL',5e6); self.m1=F('PUMP_MIN_1M_MOVE_PCT',.004); self.m3=F('PUMP_MIN_3M_MOVE_PCT',.008); self.m5=F('PUMP_MAX_5M_MOVE_PCT',.060); self.brk=I('PUMP_BREAKOUT_LOOKBACK',10)
+        self.vol=F('PUMP_VOL_SPIKE_MULT',1.8); self.minvol=F('PUMP_MIN_DOLLAR_VOL',5e6); self.m1=F('PUMP_MIN_1M_MOVE_PCT',.0025); self.m3=F('PUMP_MIN_3M_MOVE_PCT',.005); self.m5=F('PUMP_MAX_5M_MOVE_PCT',.060); self.brk=I('PUMP_BREAKOUT_LOOKBACK',10); self.long_momentum=I('PUMP_LONG_MIN_MOMENTUM',2)
         self.rmin=F('PUMP_MIN_RSI_ENTRY',52); self.rmax=F('PUMP_MAX_RSI_ENTRY',80); self.flowmin=F('PUMP_MIN_BUY_RATIO',.56); self.bookmin=F('PUMP_MIN_BOOK_IMBALANCE',.54); self.spread=F('MAX_SPREAD_PCT',.15); self.depth=F('ORDERBOOK_DEPTH_PCT',1)
         self.risk=F('MAX_RISK_PER_TRADE_PCT',.5)/100; self.dayloss=F('MAX_DAILY_LOSS_PCT',2)/100; self.maxloss=I('MAX_CONSECUTIVE_LOSSES',3); self.maxpos=I('PUMP_MAX_POSITIONS',2); self.lev=I('PUMP_LEVERAGE',2)
         self.tp1=F('TP1_R',1); self.tp2=F('TP2_R',2); self.tp3=F('TP3_R',3.5); self.tq1=F('TP1_CLOSE_PCT',.35); self.tq2=F('TP2_CLOSE_PCT',.35); self.trail=F('TRAILING_ATR_MULT',1.5); self.sl=F('PUMP_SL_ATR_MULT',1.8); self.ssl=F('SHORT_SL_ATR_MULT',1.5)
@@ -65,8 +65,7 @@ class Engine:
         vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12); vd=abs(p/vw-1)*100; green=sum(c[-2:] > o[-2:]); br=p>=max(c[-self.brk-1:-1]); failed=max(c[-6:])>=max(c[-self.brk-2:-2]) and p<c[-2]
         checks={'breakout':br,'m1':m1>=self.m1,'m3':m3>=self.m3,'volume':vr>=self.vol,'green_2':green>=2}
         momentum=sum(bool(z) for z in checks.values())
-        # Relaxed candidate gate: require 3/5 momentum signals, while keeping RSI/VWAP/5m cap strict.
-        pre_long=momentum>=3 and m5<=self.m5 and self.rmin<=r<=self.rmax and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',5.0)
+        pre_long=momentum>=self.long_momentum and m5<=self.m5 and self.rmin<=r<=self.rmax and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',5.0)
         short_checks={'move5':m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',3.0)/100,'volume':vr>=self.vol*.8,'failed_breakout':failed,'rsi':r>=F('PUMP_DUMP_MAX_RSI',72)}
         pre_short=sum(bool(z) for z in short_checks.values())>=3
         for k,vv in checks.items():
