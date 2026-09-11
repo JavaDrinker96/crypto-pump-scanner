@@ -73,11 +73,11 @@ else:
         finally:self.ml=saved
         if sig is None:return None
         if self.ml_required and saved is None:
-            self._diag('ml_unavailable'); logging.warning('ML BLOCK | %s | no compatible model',symbol); _notify(self,f'🟠 ML BLOCK | {symbol} | model unavailable'); return None
+            self._diag('ml_unavailable'); logging.warning('ML BLOCK | %s | no compatible model',symbol); return None
         try:
-            side=1. if sig.side=='long' else -1.; feats=np.asarray([[sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.vwap,sig.move5,sig.atr,sig.m1/100,sig.m3/100,sig.spread,side]],float); model=saved['model'] if isinstance(saved,dict) else saved; logging.info('ML START | %s | side=%s | features=12',symbol,sig.side); prob=float(model.predict_proba(feats)[0,1]); sig.ml_prob=prob; minimum=float(os.getenv('ML_MIN_PROBABILITY','0.58'))
+            side=1. if sig.side=='long' else -1.; feats=np.asarray([[sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.vwap,sig.move5,sig.atr,sig.m1/100,sig.m3/100,sig.spread,side]],float); model=saved['model'] if isinstance(saved,dict) else saved; logging.info('ML START | %s | side=%s | features=12',symbol); prob=float(model.predict_proba(feats)[0,1]); sig.ml_prob=prob; minimum=float(os.getenv('ML_MIN_PROBABILITY','0.58'))
             if not np.isfinite(prob) or prob<minimum:
-                self._diag('ml_rejected'); logging.info('ML REJECT | %s | probability=%.3f | min=%.3f',symbol,prob,minimum); _notify(self,f'❌ ML REJECT | {symbol} | side={sig.side.upper()} | probability={prob:.3f} | min={minimum:.3f}'); return None
+                self._diag('ml_rejected'); logging.info('ML REJECT | %s | probability=%.3f | min=%.3f',symbol,prob,minimum); return None
             logging.info('ML ACCEPT | %s | side=%s | probability=%.3f',symbol,sig.side,prob); _notify(self,f'✅ ML ACCEPT | {symbol} | side={sig.side.upper()} | probability={prob:.3f} | min={minimum:.3f}'); return sig
         except Exception:
             self._diag('ml_inference_failed'); logging.exception('ML INFERENCE FAILED | %s',symbol); _notify(self,f'🔴 ML INFERENCE FAILED | {symbol}'); return None
