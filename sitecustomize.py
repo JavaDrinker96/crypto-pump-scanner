@@ -1,4 +1,4 @@
-"""Runtime patch: fail-closed ML, Bybit WS market data, native TP/SL + runner trailing stop."""
+"""Runtime patch: fail-closed ML, Bybit WS market data, native TP/SL protection."""
 import logging, os
 try:
     import numpy as np, joblib
@@ -84,13 +84,12 @@ else:
     def _protect(self,p):
         def req(params):return self.c.request('v5/position/trading-stop','private','POST',params)
         symbol=self.c.market(p.symbol).get('id') or p.symbol.replace('/','').replace(':USDT',''); q1=float(os.getenv('TP1_CLOSE_PCT','.35')); q2=float(os.getenv('TP2_CLOSE_PCT','.35')); q3=max(0,1-q1-q2)
-        for name,tp,f in [('TP1',p.tp1,q1),('TP2',p.tp2,q2)]:
+        for name,tp,f in [('TP1',p.tp1,q1),('TP2',p.tp2,q2),('TP3',p.tp3,q3)]:
+            if f<=0: continue
             qty=float(self.c.amount_to_precision(p.symbol,p.qty*f)); params={'category':'linear','symbol':symbol,'positionIdx':0,'tpslMode':'Partial','takeProfit':str(tp),'stopLoss':str(p.stop),'tpSize':str(qty),'slSize':str(qty),'tpOrderType':'Market','slOrderType':'Market','tpTriggerBy':'MarkPrice','slTriggerBy':'MarkPrice'}; r=req(params)
             if not isinstance(r,dict) or r.get('retCode',0)!=0:raise RuntimeError(f'Bybit TP/SL failed: {r}')
             logging.info('PROTECTION SET | %s | %s qty=%s tp=%s sl=%s',p.symbol,name,qty,tp,p.stop)
-        if q3>0:
-            qty=float(self.c.amount_to_precision(p.symbol,p.qty*q3)); distance=float(p.risk)*float(os.getenv('TRAILING_ATR_MULT','1.5')); active=p.tp2; side='sell' if p.side=='long' else 'buy'; params={'category':'linear','symbol':symbol,'positionIdx':0,'side':side,'orderType':'Market','qty':str(qty),'triggerDirection':1 if p.side=='long' else 2,'triggerPrice':str(active),'triggerBy':'MarkPrice','stopOrderType':'TrailingStop','trailingStop':str(distance),'reduceOnly':True,'closeOnTrigger':True}; r=self.c.create_order(p.symbol,'market',side,qty,None,params); logging.info('RUNNER TRAILING SET | %s | qty=%s | activation=%s | distance=%s | order=%s',p.symbol,qty,active,distance,r.get('id'))
-        self.journal('protection',p,{'mode':'TP1+TP2+exchange_trailing_runner','runner_fraction':q3})
+        self.journal('protection',p,{'mode':'TP1+TP2+TP3_exchange_native'})
     def _open_with_protection(self,s):
         before=set(self.pos); _open(self,s)
         if s.symbol not in self.pos or s.symbol in before:return
@@ -104,4 +103,4 @@ else:
             finally:self.pos.pop(s.symbol,None)
             raise
     advanced_engine.Engine.__init__=_patched_init; advanced_engine.Engine.ohlcv=_ws_ohlcv; advanced_engine.Engine.flow=_ws_flow; advanced_engine.Engine.book=_ws_book; advanced_engine.Engine.signal=_patched_signal; advanced_engine.Engine.open=_open_with_protection; advanced_engine.Engine.manage=lambda self:None
-    logging.info('RUNTIME PATCH | WS market data + ML fail-closed + ML alerts + TP1/TP2 + exchange trailing runner')
+    logging.info('RUNTIME PATCH | WS market data + ML fail-closed + ML alerts + native TP1/TP2/TP3 protection')
