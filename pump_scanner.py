@@ -60,7 +60,7 @@ def main():
     mode='TRADING' if effective_trading else('LIVE-BLOCKED' if TRADING else 'ALERTS-ONLY')
     alert(f'🟢 <b>DeepAlpha ONLINE</b>\nPairs: {len(symbols)}\nMode: {mode}\nTestnet: {TESTNET}')
     logging.info('DeepAlpha ONLINE | pairs=%s | mode=%s | testnet=%s',len(symbols),mode,TESTNET)
-    engine=Engine(x,alert);scan_limit=max(10,int(os.getenv('PUMP_MAX_SCAN_SYMBOLS','40')));interval=max(5,int(os.getenv('PUMP_SCAN_INTERVAL','15')));minvol=float(os.getenv('PUMP_MIN_DOLLAR_VOL','5000000'))
+    engine=Engine(x,alert);scan_limit=max(10,int(os.getenv('PUMP_MAX_SCAN_SYMBOLS','104')));interval=max(5,int(os.getenv('PUMP_SCAN_INTERVAL','15')));minvol=float(os.getenv('PUMP_MIN_DOLLAR_VOL','5000000'))
     logging.info('SCANNER CONFIG | scan_limit=%s | interval=%ss | min_dollar_vol=%s',scan_limit,interval,minvol)
     while True:
         loop_started=time.time()
