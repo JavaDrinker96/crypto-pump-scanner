@@ -63,11 +63,13 @@ class Engine:
         if len(x)<30:self._diag('insufficient_ohlcv');return None
         c=np.array([z[4] for z in x],float); o=np.array([z[1] for z in x]); v=np.array([z[5] for z in x]); p=float(c[-1]); a=self.atr(x); r=self.rsi(c); vr=v[-1]/max(v[-21:-1].mean(),1e-12); m1=c[-1]/c[-2]-1; m3=c[-1]/c[-4]-1; m5=c[-1]/c[-6]-1
         vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12); vd=abs(p/vw-1)*100; green=sum(c[-2:] > o[-2:]); br=p>=max(c[-self.brk-1:-1]); failed=max(c[-6:])>=max(c[-self.brk-2:-2]) and p<c[-2]
+        reversal=((c[-1]<o[-1] and c[-2]<o[-2]) or (p<c[-2] and c[-1]<c[-2]))
+        short_vwap=vd>=F('PUMP_MIN_SHORT_DISTANCE_FROM_VWAP_PCT',0.5)
         checks={'breakout':br,'m1':m1>=self.m1,'m3':m3>=self.m3,'volume':vr>=self.vol,'green_2':green>=2}
         momentum=sum(bool(z) for z in checks.values())
         pre_long=momentum>=self.long_momentum and m5<=self.m5 and self.rmin<=r<=self.rmax and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',5.0)
-        short_checks={'move5':m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',1.5)/100,'volume':vr>=self.vol*.8,'failed_breakout':failed,'rsi':r>=F('PUMP_DUMP_MAX_RSI',72)}
-        pre_short=sum(bool(z) for z in short_checks.values())>=3
+        short_checks={'move5':m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',1.5)/100,'volume':vr>=self.vol*.8,'failed_breakout':failed,'reversal':reversal,'rsi':r>=F('PUMP_DUMP_MAX_RSI',72),'vwap_distance':short_vwap}
+        pre_short=sum(bool(z) for z in short_checks.values())>=4
         for k,vv in checks.items():
             if not vv:self._diag(f'long_fail_{k}')
         for k,vv in short_checks.items():
@@ -93,12 +95,33 @@ class Engine:
         if len(self.pos)>=self.maxpos or s.symbol in self.pos:return
         e=self.equity(); d=s.atr*(self.ssl if s.side=='short' else self.sl); q=e*self.risk/d if e and d else 0; m=self.c.market(s.symbol); amin=float(((m.get('limits',{}).get('amount') or {}).get('min')) or 0); q=float(self.c.amount_to_precision(s.symbol,max(q,amin)))
         if q<=0:return
+        try:
+            b=self.c.fetch_balance({'type':'swap'}); usdt=b.get('USDT') or {}; free=float((b.get('free') or {}).get('USDT') or usdt.get('free') or 0); total=float((b.get('total') or {}).get('USDT') or usdt.get('total') or 0)
+        except Exception:
+            free=total=0
+        if free>0 and s.price>0 and self.lev>0:
+            max_qty=free*self.lev*0.90/s.price
+            if q>max_qty:
+                logging.warning('ORDER RESIZE | symbol=%s | requested_qty=%s | max_qty=%s | free_usdt=%.4f | leverage=%s',s.symbol,q,max_qty,free,self.lev)
+                q=float(self.c.amount_to_precision(s.symbol,max_qty))
+        if q<amin or q<=0:
+            logging.warning('ORDER BLOCKED | symbol=%s | qty=%s | min_qty=%s | free_usdt=%.4f',s.symbol,q,amin,free)
+            if self.alert:self.alert(f'🟡 ORDER BLOCKED | {s.symbol} | insufficient margin/min qty | free={free:.2f} USDT')
+            return
         side='buy' if s.side=='long' else 'sell'; logging.info('ORDER INTENT | signal=%s | order_side=%s | symbol=%s | qty=%s',s.side,side,s.symbol,q)
         try:self.c.set_leverage(self.lev,s.symbol)
         except BadRequest as e:
             if '110043' not in str(e):raise
             logging.info('LEVERAGE UNCHANGED | symbol=%s | leverage=%s',s.symbol,self.lev)
-        o=self.c.create_order(s.symbol,'market',side,q,None,{'positionIdx':0}); logging.info('ORDER EXECUTED | symbol=%s | side=%s | qty=%s | id=%s',s.symbol,side,q,o.get('id'))
+        try:o=self.c.create_order(s.symbol,'market',side,q,None,{'positionIdx':0})
+        except Exception as e:
+            msg=str(e)
+            if '110007' in msg or 'InsufficientFunds' in msg:
+                logging.warning('ORDER BLOCKED | symbol=%s | insufficient available margin | qty=%s | free_usdt=%.4f',s.symbol,q,free)
+                if self.alert:self.alert(f'🟡 ORDER BLOCKED | {s.symbol} | insufficient available margin')
+                return
+            raise
+        logging.info('ORDER EXECUTED | symbol=%s | side=%s | qty=%s | id=%s',s.symbol,side,q,o.get('id'))
         en=float(o.get('average') or o.get('price') or s.price); sg=1 if s.side=='long' else -1; stop=en-sg*d; t1=en+sg*d*self.tp1; t2=en+sg*d*self.tp2; t3=en+sg*d*self.tp3; self.pos[s.symbol]=Position(s.symbol,s.side,en,q,stop,t1,t2,t3,d); self.journal('open',self.pos[s.symbol],{'signal':asdict(s),'order_id':o.get('id')})
     def journal(self,event,p,extra=None):
         path=os.getenv('TRADE_JOURNAL_PATH','data/trades.jsonl'); os.makedirs(os.path.dirname(path) or '.',exist_ok=True); open(path,'a',encoding='utf8').write(json.dumps({'ts':time.time(),'event':event,'position':asdict(p),**(extra or {})},default=str)+'\n')
@@ -121,7 +144,10 @@ class Engine:
                 signals+=1;logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
                 state=self.pending.get(s);count=(state[1]+1) if state and state[0]==sig.side else 1;self.pending[s]=(sig.side,count);logging.info('CONFIRM | %s %s %d/%d',sig.side.upper(),s,count,self.confirm)
                 if self.alert:self.alert(f'🚨 {sig.side.upper()} {s} score={sig.score:.2f} CONF={count}/{self.confirm} ML=waiting')
-                if count>=self.confirm and B('TRADING_ENABLED',False) and os.getenv('PUMP_MODE','alerts')=='trading' and s not in self.pos:self.open(sig);self.pending.pop(s,None)
+                if count>=self.confirm and B('TRADING_ENABLED',False) and s not in self.pos:
+                    self.open(sig);self.pending.pop(s,None)
+                elif count>=self.confirm and not B('TRADING_ENABLED',False):
+                    logging.info('ORDER BLOCKED | trading disabled | symbol=%s',s)
             except RateLimitExceeded:errors+=1;self._diag('rate_limit_exceeded');logging.error('RATE LIMIT | %s | ending scan cycle early',s);break
             except Exception:errors+=1;self._diag('unexpected_scan_error');logging.exception('signal scan failed for %s',s)
         top=sorted(self.diag.items(),key=lambda kv:kv[1],reverse=True)[:14]
