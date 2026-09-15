@@ -89,12 +89,25 @@ class Engine:
         side='long' if long else 'short'; q=flow if long else 1-flow; bi=book if long else 1-book; score=min(.3*min(vr/5,1)+.2*min(abs(m5)/.05,1)+.25*q+.15*max((bi-.5)*2,0)+.1,1)
         return Signal(s,side,p,a,r,vr,flow,book,vd,m5*100,score,'continuation' if long else 'exhaustion',m1*100,m3*100,sp,0.)
     def equity(self):
-        try:b=self.c.fetch_balance({'type':'swap'});return float((b.get('total') or {}).get('USDT') or (b.get('USDT') or {}).get('total') or 0)
-        except Exception:return 0
+        try:
+            b=self.c.fetch_balance({'type':'swap'}); usdt=b.get('USDT') or {}
+            total=float((b.get('total') or {}).get('USDT') or usdt.get('total') or 0)
+            free=float((b.get('free') or {}).get('USDT') or usdt.get('free') or 0)
+            return total if total>0 else free
+        except Exception as e:
+            logging.warning('BALANCE READ FAILED | %s',e); return 0
     def open(self,s):
-        if len(self.pos)>=self.maxpos or s.symbol in self.pos:return
+        if s.symbol in self.pos:
+            logging.info('ORDER BLOCKED | position already exists | symbol=%s',s.symbol); return
+        if len(self.pos)>=self.maxpos:
+            logging.warning('ORDER BLOCKED | max positions reached | open=%s | max=%s | symbol=%s',len(self.pos),self.maxpos,s.symbol)
+            if self.alert:self.alert(f'🟡 ORDER BLOCKED | {s.symbol} | max positions {len(self.pos)}/{self.maxpos}')
+            return
         e=self.equity(); d=s.atr*(self.ssl if s.side=='short' else self.sl); q=e*self.risk/d if e and d else 0; m=self.c.market(s.symbol); amin=float(((m.get('limits',{}).get('amount') or {}).get('min')) or 0); q=float(self.c.amount_to_precision(s.symbol,max(q,amin)))
-        if q<=0:return
+        if e<=0 or d<=0:
+            logging.warning('ORDER BLOCKED | invalid sizing inputs | symbol=%s | equity=%.4f | atr=%.8f | risk_pct=%.4f',s.symbol,e,s.atr,self.risk)
+            if self.alert:self.alert(f'🟡 ORDER BLOCKED | {s.symbol} | balance/ATR unavailable')
+            return
         try:
             b=self.c.fetch_balance({'type':'swap'}); usdt=b.get('USDT') or {}; free=float((b.get('free') or {}).get('USDT') or usdt.get('free') or 0); total=float((b.get('total') or {}).get('USDT') or usdt.get('total') or 0)
         except Exception:
