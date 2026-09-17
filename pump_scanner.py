@@ -11,6 +11,7 @@ try:
     import sitecustomize  # noqa: F401
 except Exception:
     logging.exception('RUNTIME PATCH | explicit sitecustomize import failed')
+from position_sync import sync  # noqa: F401
 from ccxt.base.errors import AuthenticationError
 from advanced_engine import Engine
 from ws_market import BybitMarketWS
