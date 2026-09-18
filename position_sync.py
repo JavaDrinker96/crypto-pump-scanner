@@ -35,7 +35,7 @@ def sync(self):
         symbol=p.get('symbol')
         size=_size(p)
         if symbol and size>0:
-            live[symbol]=(size,_side(p),float(p.get('entryPrice') or (p.get('info') or {}).get('avgPrice') or 0))
+            live[symbol]=(size,_side(p),float(p.get('entryPrice') or (p.get('info') or {}).get('avgPrice') or 0),float(p.get('stopLossPrice') or (p.get('info') or {}).get('stopLoss') or 0))
 
     for symbol in list(self.pos):
         if symbol not in live:
@@ -43,7 +43,7 @@ def sync(self):
             self.pos.pop(symbol,None)
             self.pending.pop(symbol,None)
 
-    for symbol,(size,side,entry) in live.items():
+    for symbol,(size,side,entry,stop) in live.items():
         if symbol in self.pos:
             p=self.pos[symbol]
             old=p.qty
@@ -52,9 +52,14 @@ def sync(self):
             if old and abs(size-old)/old>0.005:
                 logging.info('POSITION SYNC | symbol=%s | local_qty=%s | exchange_qty=%s',symbol,old,size)
         else:
-            self.pos[symbol]=Position(symbol,side,entry,size,0,0,0,0)
+            # The exchange snapshot does not contain the original per-unit risk
+            # or the bot's three TP legs. Preserve native exits; never invent them.
+            self.pos[symbol]=Position(
+                symbol=symbol, side=side, entry=entry, qty=size,
+                stop=stop, tp1=0, tp2=0, tp3=0, risk=None,
+            )
             logging.warning('POSITION SYNC | external/open position detected | symbol=%s | side=%s | qty=%s',symbol,side,size)
-            if self.alert:self.alert(f'🟡 POSITION SYNC | {symbol} | exchange position detected | qty={size}')
+            if self.alert:self.alert(f'🟡 POSITION SYNC | {symbol} | exchange position detected | qty={size} | new entries paused while original risk is unknown')
     return True
 
 
@@ -112,11 +117,23 @@ def _protect_exact(self,p):
 
 
 _original_run=Engine.run
+_original_open=Engine.open
+
+
+def _open_after_sync(self,signal):
+    # Recovery is bookkeeping only. Do not add exposure while an imported
+    # position's original risk is unknown; exchange-native exits keep working.
+    if any(p.risk is None for p in self.pos.values()):
+        logging.warning('ORDER BLOCKED | recovered position risk unknown | symbol=%s',signal.symbol)
+        return
+    return _original_open(self,signal)
 
 def _run(self,symbols):
-    sync(self)
+    if not sync(self):
+        raise RuntimeError('Position synchronization failed; scan skipped to prevent orders on stale state')
     return _original_run(self,symbols)
 
 Engine.run=_run
+Engine.open=_open_after_sync
 sitecustomize._protect=_protect_exact
 logging.info('POSITION SYNC | exchange reconciliation enabled; exact TP quantity allocation enabled')

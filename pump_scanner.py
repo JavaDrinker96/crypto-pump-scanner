@@ -15,6 +15,7 @@ from position_sync import sync  # noqa: F401
 from ccxt.base.errors import AuthenticationError
 from advanced_engine import Engine
 from ws_market import BybitMarketWS
+from notification_control import IncidentAlerts
 
 KEY=os.getenv('BYBIT_API_KEY','');SECRET=os.getenv('BYBIT_API_SECRET','');TESTNET=os.getenv('BYBIT_TESTNET','true').lower()=='true';TRADING=os.getenv('TRADING_ENABLED','false').lower() in ('1','true','yes','on');TG=os.getenv('TELEGRAM_TOKEN','');CHAT=os.getenv('TELEGRAM_CHAT_ID','')
 
@@ -63,13 +64,15 @@ def main():
     logging.info('DeepAlpha ONLINE | pairs=%s | mode=%s | testnet=%s',len(symbols),mode,TESTNET)
     engine=Engine(x,alert);scan_limit=max(10,int(os.getenv('PUMP_MAX_SCAN_SYMBOLS','104')));interval=max(5,int(os.getenv('PUMP_SCAN_INTERVAL','15')));minvol=float(os.getenv('PUMP_MIN_DOLLAR_VOL','5000000'))
     logging.info('SCANNER CONFIG | scan_limit=%s | interval=%ss | min_dollar_vol=%s',scan_limit,interval,minvol)
+    incidents=IncidentAlerts(alert)
     while True:
         loop_started=time.time()
         try:
             if not ws.is_healthy():
                 logging.warning('WS UNHEALTHY | waiting for reconnect | tickers=%s',len(ws.ticker_snapshot()))
-                alert('⚠️ <b>DeepAlpha WS unhealthy</b>\nWaiting for automatic reconnect.')
+                incidents.notify('websocket','⚠️ <b>DeepAlpha WS unhealthy</b>\nWaiting for automatic reconnect.')
                 time.sleep(3);continue
+            incidents.clear('websocket')
             snap=ws.ticker_snapshot();ranked=[]
             if len(snap)<max(10,min(100,len(symbols)//2)):
                 logging.warning('WS TICKER WARMUP | received=%s/%s',len(snap),len(symbols));time.sleep(2);continue
@@ -82,9 +85,10 @@ def main():
             stats=engine.run(selected)
             elapsed=time.time()-loop_started
             logging.info('SCAN RESULT | signals=%s | errors=%s | elapsed=%.1fs',stats.get('signals',0),stats.get('errors',0),elapsed)
+            incidents.clear('scanner')
         except Exception:
             logging.exception('SCANNER LOOP FAILED | elapsed=%.1fs',time.time()-loop_started)
-            alert('🔴 <b>DeepAlpha scanner error</b>\nSee Railway logs for traceback.')
+            incidents.notify('scanner','🔴 <b>DeepAlpha scanner error</b>\nSee Railway logs for traceback. Repeats limited to once every 5 minutes.')
         time.sleep(interval)
 
 if __name__=='__main__':main()
