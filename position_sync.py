@@ -73,23 +73,32 @@ def _protect_exact(self,p):
     def floor_step(v):
         return max(0.0, int((v/step)+1e-9)*step)
 
-    # Never pass a sub-minimum quantity to ccxt.amount_to_precision().
-    # Small positions use fewer TP legs instead of failing protection setup.
-    q1=floor_step(total*float(os.getenv('TP1_CLOSE_PCT','.35')))
-    q2=floor_step(total*float(os.getenv('TP2_CLOSE_PCT','.35')))
-    if q1<amin: q1=0.0
-    if q2<amin: q2=0.0
-    q3=max(0.0,total-q1-q2)
-    if q3>0: q3=float(self.c.amount_to_precision(p.symbol,q3))
-    if q3>0 and q3<amin:
-        if q2>=amin:
-            q2=float(self.c.amount_to_precision(p.symbol,q2+q3)); q3=0.0
-        elif q1>=amin:
-            q1=float(self.c.amount_to_precision(p.symbol,q1+q3)); q3=0.0
-        else:
-            q1=total; q2=q3=0.0
-    if q1+q2+q3 < total:
-        q3=float(self.c.amount_to_precision(p.symbol,total-q1-q2))
+    # Allocate integer qty steps so every submitted leg is valid and the sum equals position qty.
+    raw_total=float(p.qty)
+    total=floor_step(raw_total)
+    if total<amin:
+        raise RuntimeError(f'Position qty below exchange minimum: qty={total} min={amin}')
+    min_steps=max(1,int(round(amin/step)))
+    total_steps=max(1,int(round(total/step)))
+    q1=q2=q3=0.0
+    n1=int(total_steps*float(os.getenv('TP1_CLOSE_PCT','.35')))
+    n2=int(total_steps*float(os.getenv('TP2_CLOSE_PCT','.35')))
+    if total_steps < 3*min_steps:
+        q3=total
+    else:
+        n1=max(min_steps,n1); n2=max(min_steps,n2)
+        if n1+n2>total_steps-min_steps:
+            n1=min_steps; n2=min_steps
+        n3=total_steps-n1-n2
+        if n3<min_steps:
+            n3=min_steps
+            n2=max(min_steps,total_steps-n1-n3)
+        q1=n1*step; q2=n2*step; q3=n3*step
+    qsum=q1+q2+q3
+    if abs(qsum-total)>step*0.01:
+        raise RuntimeError(f'TP allocation mismatch: total={total} sum={qsum} step={step} min={amin}')
+    logging.info('PROTECTION PLAN | symbol=%s | entry_qty=%s | min_qty=%s | qty_step=%s | TP1 qty=%s price=%s | TP2 qty=%s price=%s | TP3 qty=%s price=%s | SL=%s | sum=%s',
+                 p.symbol,total,amin,step,q1,p.tp1,q2,p.tp2,q3,p.tp3,p.stop,qsum)
     legs=[('TP1',p.tp1,q1),('TP2',p.tp2,q2),('TP3',p.tp3,q3)]
     for name,tp,qty in legs:
         if qty<=0: continue
