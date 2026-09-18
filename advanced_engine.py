@@ -155,7 +155,9 @@ class Engine:
         for k in ('trade_id','signal_time','order_time','fill_time','entry_price','entry_qty','tp1_price','tp2_price','tp3_price','sl_price','tp1_fill_qty','tp2_fill_qty','tp3_fill_qty','exit_price','exit_time','exit_reason','realized_pnl','fees','mfe_pct','mae_pct','duration_sec','ml_probability','rsi','volume_ratio','flow','book','spread','vwap_distance_pct','move1_pct','move3_pct','move5_pct','trade_status'):
             if hasattr(p,k): d[k]=getattr(p,k)
         rec={'ts':time.time(),'event':event,**d,**(extra or {})}
-        with open(path,'a',encoding='utf8') as f: f.write(json.dumps(rec,default=str,separators=(',',':'))+'\n')
+        line=json.dumps(rec,default=str,separators=(',',':'))
+        with open(path,'a',encoding='utf8') as f: f.write(line+'\n')
+        logging.info('TRADE JOURNAL | %s',line)
     def partial(self,p,f,reason):
         q=float(self.c.amount_to_precision(p.symbol,p.qty*f))
         if q>0:self.c.create_order(p.symbol,'market','sell' if p.side=='long' else 'buy',q,None,{'reduceOnly':True,'positionIdx':0});p.remaining-=f;self.journal(reason.lower(),p,{'qty':q})
