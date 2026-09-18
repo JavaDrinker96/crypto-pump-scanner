@@ -1,5 +1,5 @@
 """Advanced risk-first Bybit signal/execution engine used by pump_scanner."""
-import json, os, time, logging
+import json, os, time, logging, uuid
 from dataclasses import dataclass, asdict
 import numpy as np
 try:
@@ -135,18 +135,41 @@ class Engine:
                 return
             raise
         logging.info('ORDER EXECUTED | symbol=%s | side=%s | qty=%s | id=%s',s.symbol,side,q,o.get('id'))
-        en=float(o.get('average') or o.get('price') or s.price); sg=1 if s.side=='long' else -1; stop=en-sg*d; t1=en+sg*d*self.tp1; t2=en+sg*d*self.tp2; t3=en+sg*d*self.tp3; self.pos[s.symbol]=Position(s.symbol,s.side,en,q,stop,t1,t2,t3,d); self.journal('open',self.pos[s.symbol],{'signal':asdict(s),'order_id':o.get('id')})
+        en=float(o.get('average') or o.get('price') or s.price); sg=1 if s.side=='long' else -1; stop=en-sg*d; t1=en+sg*d*self.tp1; t2=en+sg*d*self.tp2; t3=en+sg*d*self.tp3; self.pos[s.symbol]=Position(s.symbol,s.side,en,q,stop,t1,t2,t3,d)
+        p=self.pos[s.symbol]
+        p.trade_id=uuid.uuid4().hex
+        p.signal_time=getattr(s,'signal_time',time.time()); p.order_time=time.time(); p.fill_time=time.time()
+        p.entry_price=en; p.entry_qty=q
+        p.tp1_price=t1; p.tp2_price=t2; p.tp3_price=t3; p.sl_price=stop
+        p.tp1_fill_qty=0.0; p.tp2_fill_qty=0.0; p.tp3_fill_qty=0.0
+        p.exit_price=None; p.exit_time=None; p.exit_reason=None; p.realized_pnl=None; p.fees=0.0
+        p.mfe_pct=0.0; p.mae_pct=0.0; p.duration_sec=None
+        p.ml_probability=s.ml_prob; p.rsi=s.rsi; p.volume_ratio=s.vol; p.flow=s.flow; p.book=s.book; p.spread=s.spread
+        p.vwap_distance_pct=s.vwap; p.move1_pct=s.m1; p.move3_pct=s.m3; p.move5_pct=s.move5
+        p.trade_status='OPEN'
+        self.journal('TRADE_OPEN',p,{'signal':asdict(s),'order_id':o.get('id')})
     def journal(self,event,p,extra=None):
-        path=os.getenv('TRADE_JOURNAL_PATH','data/trades.jsonl'); os.makedirs(os.path.dirname(path) or '.',exist_ok=True); open(path,'a',encoding='utf8').write(json.dumps({'ts':time.time(),'event':event,'position':asdict(p),**(extra or {})},default=str)+'\n')
+        path=os.getenv('TRADE_JOURNAL_PATH','data/trades.jsonl')
+        os.makedirs(os.path.dirname(path) or '.',exist_ok=True)
+        d=asdict(p)
+        for k in ('trade_id','signal_time','order_time','fill_time','entry_price','entry_qty','tp1_price','tp2_price','tp3_price','sl_price','tp1_fill_qty','tp2_fill_qty','tp3_fill_qty','exit_price','exit_time','exit_reason','realized_pnl','fees','mfe_pct','mae_pct','duration_sec','ml_probability','rsi','volume_ratio','flow','book','spread','vwap_distance_pct','move1_pct','move3_pct','move5_pct','trade_status'):
+            if hasattr(p,k): d[k]=getattr(p,k)
+        rec={'ts':time.time(),'event':event,**d,**(extra or {})}
+        with open(path,'a',encoding='utf8') as f: f.write(json.dumps(rec,default=str,separators=(',',':'))+'\n')
     def partial(self,p,f,reason):
         q=float(self.c.amount_to_precision(p.symbol,p.qty*f))
         if q>0:self.c.create_order(p.symbol,'market','sell' if p.side=='long' else 'buy',q,None,{'reduceOnly':True,'positionIdx':0});p.remaining-=f;self.journal(reason.lower(),p,{'qty':q})
     def close(self,p,reason):
         q=float(self.c.amount_to_precision(p.symbol,p.qty*p.remaining))
         if q>0:self.c.create_order(p.symbol,'market','sell' if p.side=='long' else 'buy',q,None,{'reduceOnly':True,'positionIdx':0})
+        exit_time=time.time()
         try:px=float(self.c.fetch_ticker(p.symbol)['last']);pnl=(px-p.entry)*p.qty*(1 if p.side=='long' else -1)
-        except Exception:pnl=0
-        self.realized+=pnl;self.losses=self.losses+1 if pnl<0 else 0;self.journal('close',p,{'reason':reason,'pnl':pnl});self.pos.pop(p.symbol,None)
+        except Exception:px=None;pnl=0.0
+        p.exit_price=px; p.exit_time=exit_time; p.exit_reason=reason; p.realized_pnl=pnl; p.duration_sec=exit_time-float(getattr(p,'fill_time',exit_time)); p.trade_status='CLOSED'
+        self.realized+=pnl;self.losses=self.losses+1 if pnl<0 else 0
+        self.journal('TRADE_CLOSE',p,{'reason':reason,'pnl_estimate':pnl,'pnl_source':'ticker_last_fallback'})
+        self.pos.pop(p.symbol,None)
+
     def manage(self):pass
     def run(self,symbols):
         signals=0;errors=0;self.diag={}
@@ -154,7 +177,7 @@ class Engine:
             try:
                 sig=self.signal(s)
                 if not sig:self.pending.pop(s,None);continue
-                signals+=1;logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
+                signals+=1; sig.signal_time=time.time(); logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
                 state=self.pending.get(s);count=(state[1]+1) if state and state[0]==sig.side else 1;self.pending[s]=(sig.side,count);logging.info('CONFIRM | %s %s %d/%d',sig.side.upper(),s,count,self.confirm)
                 if self.alert:self.alert(f'🚨 {sig.side.upper()} {s} score={sig.score:.2f} CONF={count}/{self.confirm} ML=waiting')
                 if count>=self.confirm and B('TRADING_ENABLED',False) and s not in self.pos:
