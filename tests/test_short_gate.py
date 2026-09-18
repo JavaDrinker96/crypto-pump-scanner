@@ -62,7 +62,6 @@ class ShortConfirmationTests(unittest.TestCase):
         def __init__(self):
             super().__init__(client=object(), alert=None)
             self.opened = []
-            self.confirm = 1
 
         def signal(self, symbol):
             return Signal(
@@ -75,9 +74,17 @@ class ShortConfirmationTests(unittest.TestCase):
         def open(self, sig):
             self.opened.append(sig.symbol)
 
-    def test_short_requires_two_confirmations_even_when_global_confirm_is_one(self):
-        engine = self.StubEngine()
-        with patch.dict(os.environ, {'TRADING_ENABLED': 'true'}):
+    def test_short_confirmation_uses_separate_environment_variable(self):
+        with patch.dict(os.environ, {
+            'TRADING_ENABLED': 'true',
+            'SIGNAL_CONFIRM_CYCLES': '1',
+            'SHORT_SIGNAL_CONFIRM_CYCLES': '3',
+        }):
+            engine = self.StubEngine()
+            self.assertEqual(engine.confirm, 1)
+            self.assertEqual(engine.short_confirm, 3)
+            engine.run(['X/USDT:USDT'])
+            self.assertEqual(engine.opened, [])
             engine.run(['X/USDT:USDT'])
             self.assertEqual(engine.opened, [])
             engine.run(['X/USDT:USDT'])
