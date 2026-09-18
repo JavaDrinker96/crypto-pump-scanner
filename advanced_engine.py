@@ -16,6 +16,21 @@ F=lambda k,d: float(os.getenv(k,d))
 I=lambda k,d: int(os.getenv(k,d))
 B=lambda k,d: os.getenv(k,str(d)).lower() in ('1','true','yes','on')
 
+def short_exhaustion_gate(m1,m3,m5,rsi,volume_ratio,reversal,vwap_distance,vol_threshold,
+                          min_move_pct=0.8,min_rsi=65,min_vwap_pct=0.5,
+                          dumped_1m_pct=0.30,dumped_3m_pct=0.70):
+    already_dumped=((m1<=-(dumped_1m_pct/100) and m3<=0) or
+                    m3<=-(dumped_3m_pct/100) or rsi<45)
+    checks={
+        'prior_pump':m5>=min_move_pct/100,
+        'volume':volume_ratio>=vol_threshold*.8,
+        'reversal':bool(reversal),
+        'rsi':rsi>=min_rsi,
+        'vwap_distance':vwap_distance>=min_vwap_pct,
+        'not_already_dumped':not already_dumped,
+    }
+    return all(bool(v) for v in checks.values()), checks
+
 @dataclass
 class Signal:
     symbol:str; side:str; price:float; atr:float; rsi:float; vol:float; flow:float; book:float; vwap:float; move5:float; score:float; reason:str; m1:float=0.; m3:float=0.; spread:float=0.; ml_prob:float=0.
@@ -68,22 +83,15 @@ class Engine:
         checks={'breakout':br,'m1':m1>=self.m1,'m3':m3>=self.m3,'volume':vr>=self.vol,'green_2':green>=2}
         momentum=sum(bool(z) for z in checks.values())
         pre_long=momentum>=self.long_momentum and m5<=self.m5 and self.rmin<=r<=self.rmax and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',5.0)
-        short_min_move=F('PUMP_SHORT_MIN_5M_MOVE_PCT',0.8)/100
-        short_min_rsi=F('PUMP_SHORT_MIN_RSI',65)
-        short_min_vwap=F('PUMP_SHORT_MIN_VWAP_DISTANCE_PCT',0.5)
-        dumped_m1=F('PUMP_SHORT_ALREADY_DUMPED_1M_PCT',0.30)/100
-        dumped_m3=F('PUMP_SHORT_ALREADY_DUMPED_3M_PCT',0.70)/100
         short_reversal=failed or reversal
-        already_dumped=((m1<=-dumped_m1 and m3<=0) or m3<=-dumped_m3 or r<45)
-        short_checks={
-            'prior_pump':m5>=short_min_move,
-            'volume':vr>=self.vol*.8,
-            'reversal':short_reversal,
-            'rsi':r>=short_min_rsi,
-            'vwap_distance':vd>=short_min_vwap,
-            'not_already_dumped':not already_dumped,
-        }
-        pre_short=all(bool(z) for z in short_checks.values())
+        pre_short,short_checks=short_exhaustion_gate(
+            m1,m3,m5,r,vr,short_reversal,vd,self.vol,
+            F('PUMP_SHORT_MIN_5M_MOVE_PCT',0.8),
+            F('PUMP_SHORT_MIN_RSI',65),
+            F('PUMP_SHORT_MIN_VWAP_DISTANCE_PCT',0.5),
+            F('PUMP_SHORT_ALREADY_DUMPED_1M_PCT',0.30),
+            F('PUMP_SHORT_ALREADY_DUMPED_3M_PCT',0.70),
+        )
         if (vr>=self.vol*.8 and short_reversal) and not pre_short:
             reasons=[k for k,vv in short_checks.items() if not vv]
             logging.info('SHORT REJECT | %s | reasons=%s | rsi=%.1f | m1=%.3f%% | m3=%.3f%% | m5=%.3f%% | vwap=%.3f%%',
