@@ -21,7 +21,7 @@ class Signal:
     symbol:str; side:str; price:float; atr:float; rsi:float; vol:float; flow:float; book:float; vwap:float; move5:float; score:float; reason:str; m1:float=0.; m3:float=0.; spread:float=0.; ml_prob:float=0.
 @dataclass
 class Position:
-    symbol:str; side:str; entry:float; qty:float; stop:float; tp1:float; tp2:float; tp3:float; risk:float; remaining:float=1.; tp1_done:bool=False; tp2_done:bool=False
+    symbol:str; side:str; entry:float; qty:float; stop:float; tp1:float; tp2:float; tp3:float; risk:float | None; remaining:float=1.; tp1_done:bool=False; tp2_done:bool=False
 
 class Engine:
     def __init__(self,client,alert=None):
