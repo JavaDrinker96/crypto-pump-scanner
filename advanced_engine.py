@@ -46,7 +46,7 @@ class Engine:
         self.rmin=F('PUMP_MIN_RSI_ENTRY',52); self.rmax=F('PUMP_MAX_RSI_ENTRY',80); self.flowmin=F('PUMP_MIN_BUY_RATIO',.56); self.bookmin=F('PUMP_MIN_BOOK_IMBALANCE',.54); self.spread=F('MAX_SPREAD_PCT',.15); self.depth=F('ORDERBOOK_DEPTH_PCT',1)
         self.risk=F('MAX_RISK_PER_TRADE_PCT',.5)/100; self.dayloss=F('MAX_DAILY_LOSS_PCT',2)/100; self.maxloss=I('MAX_CONSECUTIVE_LOSSES',3); self.maxpos=I('PUMP_MAX_POSITIONS',2); self.lev=I('PUMP_LEVERAGE',2)
         self.tp1=F('TP1_R',1); self.tp2=F('TP2_R',2); self.tp3=F('TP3_R',3.5); self.tq1=F('TP1_CLOSE_PCT',.35); self.tq2=F('TP2_CLOSE_PCT',.35); self.trail=F('TRAILING_ATR_MULT',1.5); self.sl=F('PUMP_SL_ATR_MULT',1.8); self.ssl=F('SHORT_SL_ATR_MULT',1.5)
-        self.confirm=max(1,I('SIGNAL_CONFIRM_CYCLES',2)); self.ml=None; self.ml_min=F('ML_MIN_PROBABILITY',.58)
+        self.confirm=max(1,I('SIGNAL_CONFIRM_CYCLES',2)); self.short_confirm=max(1,I('SHORT_SIGNAL_CONFIRM_CYCLES',2)); self.ml=None; self.ml_min=F('ML_MIN_PROBABILITY',.58)
         path=os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib')
         if B('ML_ENABLED',True) and joblib and os.path.exists(path):
             try:self.ml=joblib.load(path)
@@ -207,7 +207,7 @@ class Engine:
                 if not sig:self.pending.pop(s,None);continue
                 signals+=1; sig.signal_time=time.time(); logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
                 state=self.pending.get(s);count=(state[1]+1) if state and state[0]==sig.side else 1;self.pending[s]=(sig.side,count)
-                required=max(2,self.confirm) if sig.side=='short' else self.confirm
+                required=self.short_confirm if sig.side=='short' else self.confirm
                 logging.info('CONFIRM | %s %s %d/%d',sig.side.upper(),s,count,required)
                 if self.alert:self.alert(f'🚨 {sig.side.upper()} {s} score={sig.score:.2f} CONF={count}/{required} ML={sig.ml_prob:.3f}')
                 if count>=required and B('TRADING_ENABLED',False) and s not in self.pos:
