@@ -25,7 +25,7 @@ def _side(pos):
 
 def sync(self):
     try:
-        positions=self.c.fetch_positions(params={'category':'linear'})
+        positions=self.c.fetch_positions(params={'category':'linear','settleCoin':'USDT'})
     except Exception as e:
         logging.warning('POSITION SYNC FAILED | %s',e)
         return False
@@ -64,21 +64,32 @@ def _protect_exact(self,p):
 
     symbol=self.c.market(p.symbol).get('id') or p.symbol.replace('/','').replace(':USDT','')
     total=float(self.c.amount_to_precision(p.symbol,p.qty))
-    amin=float(((self.c.market(p.symbol).get('limits',{}).get('amount') or {}).get('min')) or 0)
-    q1=float(self.c.amount_to_precision(p.symbol,total*float(os.getenv('TP1_CLOSE_PCT','.35'))))
-    q2=float(self.c.amount_to_precision(p.symbol,total*float(os.getenv('TP2_CLOSE_PCT','.35'))))
-    q3=float(self.c.amount_to_precision(p.symbol,max(0,total-q1-q2)))
+    market=self.c.market(p.symbol)
+    limits=market.get('limits',{}).get('amount') or {}
+    amin=float(limits.get('min') or 0)
+    step=float(((market.get('info') or {}).get('lotSizeFilter') or {}).get('qtyStep') or 0)
+    if step<=0: step=amin or 1.0
 
-    # Precision rounding can otherwise leave a tiny unprotected remainder.
-    # If the remainder cannot be a valid standalone TP, fold it into TP2;
-    # if the position is too small for three legs, use one TP for the full size.
+    def floor_step(v):
+        return max(0.0, int((v/step)+1e-9)*step)
+
+    # Never pass a sub-minimum quantity to ccxt.amount_to_precision().
+    # Small positions use fewer TP legs instead of failing protection setup.
+    q1=floor_step(total*float(os.getenv('TP1_CLOSE_PCT','.35')))
+    q2=floor_step(total*float(os.getenv('TP2_CLOSE_PCT','.35')))
+    if q1<amin: q1=0.0
+    if q2<amin: q2=0.0
+    q3=max(0.0,total-q1-q2)
+    if q3>0: q3=float(self.c.amount_to_precision(p.symbol,q3))
     if q3>0 and q3<amin:
-        q2=float(self.c.amount_to_precision(p.symbol,q2+q3));q3=0
-    if q2>0 and q2<amin:
-        q1=float(self.c.amount_to_precision(p.symbol,q1+q2+q3));q2=q3=0
-    if q1>0 and q1<amin:
-        q1=total;q2=q3=0
-
+        if q2>=amin:
+            q2=float(self.c.amount_to_precision(p.symbol,q2+q3)); q3=0.0
+        elif q1>=amin:
+            q1=float(self.c.amount_to_precision(p.symbol,q1+q3)); q3=0.0
+        else:
+            q1=total; q2=q3=0.0
+    if q1+q2+q3 < total:
+        q3=float(self.c.amount_to_precision(p.symbol,total-q1-q2))
     legs=[('TP1',p.tp1,q1),('TP2',p.tp2,q2),('TP3',p.tp3,q3)]
     for name,tp,qty in legs:
         if qty<=0: continue
