@@ -16,6 +16,21 @@ F=lambda k,d: float(os.getenv(k,d))
 I=lambda k,d: int(os.getenv(k,d))
 B=lambda k,d: os.getenv(k,str(d)).lower() in ('1','true','yes','on')
 
+def short_exhaustion_gate(m1,m3,m5,rsi,volume_ratio,reversal,vwap_distance,vol_threshold,
+                          min_move_pct=0.8,min_rsi=65,min_vwap_pct=0.5,
+                          dumped_1m_pct=0.30,dumped_3m_pct=0.70):
+    already_dumped=((m1<=-(dumped_1m_pct/100) and m3<=0) or
+                    m3<=-(dumped_3m_pct/100) or rsi<45)
+    checks={
+        'prior_pump':m5>=min_move_pct/100,
+        'volume':volume_ratio>=vol_threshold*.8,
+        'reversal':bool(reversal),
+        'rsi':rsi>=min_rsi,
+        'vwap_distance':vwap_distance>=min_vwap_pct,
+        'not_already_dumped':not already_dumped,
+    }
+    return all(bool(v) for v in checks.values()), checks
+
 @dataclass
 class Signal:
     symbol:str; side:str; price:float; atr:float; rsi:float; vol:float; flow:float; book:float; vwap:float; move5:float; score:float; reason:str; m1:float=0.; m3:float=0.; spread:float=0.; ml_prob:float=0.
@@ -31,7 +46,7 @@ class Engine:
         self.rmin=F('PUMP_MIN_RSI_ENTRY',52); self.rmax=F('PUMP_MAX_RSI_ENTRY',80); self.flowmin=F('PUMP_MIN_BUY_RATIO',.56); self.bookmin=F('PUMP_MIN_BOOK_IMBALANCE',.54); self.spread=F('MAX_SPREAD_PCT',.15); self.depth=F('ORDERBOOK_DEPTH_PCT',1)
         self.risk=F('MAX_RISK_PER_TRADE_PCT',.5)/100; self.dayloss=F('MAX_DAILY_LOSS_PCT',2)/100; self.maxloss=I('MAX_CONSECUTIVE_LOSSES',3); self.maxpos=I('PUMP_MAX_POSITIONS',2); self.lev=I('PUMP_LEVERAGE',2)
         self.tp1=F('TP1_R',1); self.tp2=F('TP2_R',2); self.tp3=F('TP3_R',3.5); self.tq1=F('TP1_CLOSE_PCT',.35); self.tq2=F('TP2_CLOSE_PCT',.35); self.trail=F('TRAILING_ATR_MULT',1.5); self.sl=F('PUMP_SL_ATR_MULT',1.8); self.ssl=F('SHORT_SL_ATR_MULT',1.5)
-        self.confirm=max(1,I('SIGNAL_CONFIRM_CYCLES',2)); self.ml=None; self.ml_min=F('ML_MIN_PROBABILITY',.58)
+        self.confirm=max(1,I('SIGNAL_CONFIRM_CYCLES',2)); self.short_confirm=max(1,I('SHORT_SIGNAL_CONFIRM_CYCLES',2)); self.ml=None; self.ml_min=F('ML_MIN_PROBABILITY',.58)
         path=os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib')
         if B('ML_ENABLED',True) and joblib and os.path.exists(path):
             try:self.ml=joblib.load(path)
@@ -68,8 +83,19 @@ class Engine:
         checks={'breakout':br,'m1':m1>=self.m1,'m3':m3>=self.m3,'volume':vr>=self.vol,'green_2':green>=2}
         momentum=sum(bool(z) for z in checks.values())
         pre_long=momentum>=self.long_momentum and m5<=self.m5 and self.rmin<=r<=self.rmax and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',5.0)
-        short_checks={'move5':m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',1.5)/100,'volume':vr>=self.vol*.8,'failed_breakout':failed,'reversal':reversal,'rsi':r>=F('PUMP_DUMP_MAX_RSI',72),'vwap_distance':short_vwap}
-        pre_short=sum(bool(z) for z in short_checks.values())>=4
+        short_reversal=failed or reversal
+        pre_short,short_checks=short_exhaustion_gate(
+            m1,m3,m5,r,vr,short_reversal,vd,self.vol,
+            F('PUMP_SHORT_MIN_5M_MOVE_PCT',0.8),
+            F('PUMP_SHORT_MIN_RSI',65),
+            F('PUMP_SHORT_MIN_VWAP_DISTANCE_PCT',0.5),
+            F('PUMP_SHORT_ALREADY_DUMPED_1M_PCT',0.30),
+            F('PUMP_SHORT_ALREADY_DUMPED_3M_PCT',0.70),
+        )
+        if (vr>=self.vol*.8 and short_reversal) and not pre_short:
+            reasons=[k for k,vv in short_checks.items() if not vv]
+            logging.info('SHORT REJECT | %s | reasons=%s | rsi=%.1f | m1=%.3f%% | m3=%.3f%% | m5=%.3f%% | vwap=%.3f%%',
+                         s,','.join(reasons),r,m1*100,m3*100,m5*100,vd)
         for k,vv in checks.items():
             if not vv:self._diag(f'long_fail_{k}')
         for k,vv in short_checks.items():
@@ -180,11 +206,13 @@ class Engine:
                 sig=self.signal(s)
                 if not sig:self.pending.pop(s,None);continue
                 signals+=1; sig.signal_time=time.time(); logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
-                state=self.pending.get(s);count=(state[1]+1) if state and state[0]==sig.side else 1;self.pending[s]=(sig.side,count);logging.info('CONFIRM | %s %s %d/%d',sig.side.upper(),s,count,self.confirm)
-                if self.alert:self.alert(f'🚨 {sig.side.upper()} {s} score={sig.score:.2f} CONF={count}/{self.confirm} ML=waiting')
-                if count>=self.confirm and B('TRADING_ENABLED',False) and s not in self.pos:
+                state=self.pending.get(s);count=(state[1]+1) if state and state[0]==sig.side else 1;self.pending[s]=(sig.side,count)
+                required=self.short_confirm if sig.side=='short' else self.confirm
+                logging.info('CONFIRM | %s %s %d/%d',sig.side.upper(),s,count,required)
+                if self.alert:self.alert(f'🚨 {sig.side.upper()} {s} score={sig.score:.2f} CONF={count}/{required} ML={sig.ml_prob:.3f}')
+                if count>=required and B('TRADING_ENABLED',False) and s not in self.pos:
                     self.open(sig);self.pending.pop(s,None)
-                elif count>=self.confirm and not B('TRADING_ENABLED',False):
+                elif count>=required and not B('TRADING_ENABLED',False):
                     logging.info('ORDER BLOCKED | trading disabled | symbol=%s',s)
             except RateLimitExceeded:errors+=1;self._diag('rate_limit_exceeded');logging.error('RATE LIMIT | %s | ending scan cycle early',s);break
             except Exception:errors+=1;self._diag('unexpected_scan_error');logging.exception('signal scan failed for %s',s)
