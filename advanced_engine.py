@@ -68,8 +68,26 @@ class Engine:
         checks={'breakout':br,'m1':m1>=self.m1,'m3':m3>=self.m3,'volume':vr>=self.vol,'green_2':green>=2}
         momentum=sum(bool(z) for z in checks.values())
         pre_long=momentum>=self.long_momentum and m5<=self.m5 and self.rmin<=r<=self.rmax and vd<=F('PUMP_MAX_DISTANCE_FROM_VWAP_PCT',5.0)
-        short_checks={'move5':m5>=F('PUMP_MAX_ENTRY_5M_MOVE_PCT',1.5)/100,'volume':vr>=self.vol*.8,'failed_breakout':failed,'reversal':reversal,'rsi':r>=F('PUMP_DUMP_MAX_RSI',72),'vwap_distance':short_vwap}
-        pre_short=sum(bool(z) for z in short_checks.values())>=4
+        short_min_move=F('PUMP_SHORT_MIN_5M_MOVE_PCT',0.8)/100
+        short_min_rsi=F('PUMP_SHORT_MIN_RSI',65)
+        short_min_vwap=F('PUMP_SHORT_MIN_VWAP_DISTANCE_PCT',0.5)
+        dumped_m1=F('PUMP_SHORT_ALREADY_DUMPED_1M_PCT',0.30)/100
+        dumped_m3=F('PUMP_SHORT_ALREADY_DUMPED_3M_PCT',0.70)/100
+        short_reversal=failed or reversal
+        already_dumped=((m1<=-dumped_m1 and m3<=0) or m3<=-dumped_m3 or r<45)
+        short_checks={
+            'prior_pump':m5>=short_min_move,
+            'volume':vr>=self.vol*.8,
+            'reversal':short_reversal,
+            'rsi':r>=short_min_rsi,
+            'vwap_distance':vd>=short_min_vwap,
+            'not_already_dumped':not already_dumped,
+        }
+        pre_short=all(bool(z) for z in short_checks.values())
+        if (vr>=self.vol*.8 and short_reversal) and not pre_short:
+            reasons=[k for k,vv in short_checks.items() if not vv]
+            logging.info('SHORT REJECT | %s | reasons=%s | rsi=%.1f | m1=%.3f%% | m3=%.3f%% | m5=%.3f%% | vwap=%.3f%%',
+                         s,','.join(reasons),r,m1*100,m3*100,m5*100,vd)
         for k,vv in checks.items():
             if not vv:self._diag(f'long_fail_{k}')
         for k,vv in short_checks.items():
@@ -180,11 +198,13 @@ class Engine:
                 sig=self.signal(s)
                 if not sig:self.pending.pop(s,None);continue
                 signals+=1; sig.signal_time=time.time(); logging.info('SIGNAL | %s %s score=%.2f rsi=%.1f vol=%.1fx flow=%.2f book=%.2f spread=%.3f%%',sig.side.upper(),s,sig.score,sig.rsi,sig.vol,sig.flow,sig.book,sig.spread)
-                state=self.pending.get(s);count=(state[1]+1) if state and state[0]==sig.side else 1;self.pending[s]=(sig.side,count);logging.info('CONFIRM | %s %s %d/%d',sig.side.upper(),s,count,self.confirm)
-                if self.alert:self.alert(f'🚨 {sig.side.upper()} {s} score={sig.score:.2f} CONF={count}/{self.confirm} ML=waiting')
-                if count>=self.confirm and B('TRADING_ENABLED',False) and s not in self.pos:
+                state=self.pending.get(s);count=(state[1]+1) if state and state[0]==sig.side else 1;self.pending[s]=(sig.side,count)
+                required=max(2,self.confirm) if sig.side=='short' else self.confirm
+                logging.info('CONFIRM | %s %s %d/%d',sig.side.upper(),s,count,required)
+                if self.alert:self.alert(f'🚨 {sig.side.upper()} {s} score={sig.score:.2f} CONF={count}/{required} ML={sig.ml_prob:.3f}')
+                if count>=required and B('TRADING_ENABLED',False) and s not in self.pos:
                     self.open(sig);self.pending.pop(s,None)
-                elif count>=self.confirm and not B('TRADING_ENABLED',False):
+                elif count>=required and not B('TRADING_ENABLED',False):
                     logging.info('ORDER BLOCKED | trading disabled | symbol=%s',s)
             except RateLimitExceeded:errors+=1;self._diag('rate_limit_exceeded');logging.error('RATE LIMIT | %s | ending scan cycle early',s);break
             except Exception:errors+=1;self._diag('unexpected_scan_error');logging.exception('signal scan failed for %s',s)
