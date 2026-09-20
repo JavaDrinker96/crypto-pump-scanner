@@ -144,6 +144,9 @@ def _reconcile_executions(self,p):
     since=int((float(getattr(p,'fill_time',time.time()))-10)*1000)
     try:
         trades=self.c.fetch_my_trades(p.symbol,since=since,limit=100,params={'category':'linear'})
+        if not isinstance(trades,(list,tuple)):
+            logging.warning('EXECUTION RECONCILE SKIPPED | %s | unexpected response type=%s',p.symbol,type(trades).__name__)
+            return 0.0
     except Exception:
         logging.exception('EXECUTION RECONCILE FAILED | %s',p.symbol)
         return 0.0
