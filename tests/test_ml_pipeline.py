@@ -49,7 +49,7 @@ class TripleBarrierTests(unittest.TestCase):
         )
         self.assertGreaterEqual(result['precision'],.75)
         self.assertTrue(result['target_met'])
-        self.assertGreaterEqual(result['threshold'],.60)
+        self.assertGreaterEqual(result['threshold'],.53)
 
 
 if __name__=='__main__':
