@@ -175,7 +175,7 @@ def _reconcile_executions(self,p):
             gross=(price-float(p.entry))*qty*direction
             net=gross-fee
             p.exit_fees+=fee; p.realized_pnl+=net; p.exit_filled_qty+=qty; added_exit_qty+=qty
-            self.record_exit_fill(net)
+        self.record_exit_fill(net)
             if reason.startswith('TP') and reason not in p.tp_hits:p.tp_hits.append(reason)
             if reason=='TP1':p.tp1_done=True
             if reason=='TP2':p.tp2_done=True
