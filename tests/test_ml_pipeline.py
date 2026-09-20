@@ -1,6 +1,6 @@
 import unittest
 
-from ml_pipeline import FEATURE_NAMES, triple_barrier_label
+from ml_pipeline import FEATURE_NAMES, calibrate_threshold, triple_barrier_label
 
 
 def rows_with_constant_range(count=40,price=100.0):
@@ -39,6 +39,17 @@ class TripleBarrierTests(unittest.TestCase):
         self.assertNotIn('flow',FEATURE_NAMES)
         self.assertNotIn('book',FEATURE_NAMES)
         self.assertEqual(len(FEATURE_NAMES),8)
+
+    def test_threshold_calibration_chooses_target_precision(self):
+        result=calibrate_threshold(
+            [.51,.52,.60,.61,.70,.71],
+            [0,0,1,0,1,1],
+            minimum_samples=2,
+            target_precision=.75,
+        )
+        self.assertGreaterEqual(result['precision'],.75)
+        self.assertTrue(result['target_met'])
+        self.assertGreaterEqual(result['threshold'],.60)
 
 
 if __name__=='__main__':
