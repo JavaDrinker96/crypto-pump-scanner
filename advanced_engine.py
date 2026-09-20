@@ -155,29 +155,59 @@ class Engine:
         path=os.getenv('TRADE_JOURNAL_PATH','data/trades.jsonl')
         if not os.path.exists(path):return
         today=time.strftime('%Y-%m-%d',time.gmtime())
-        closes=[]
+        closes=[]; open_records={}; unresolved=set()
         try:
             with open(path,'r',encoding='utf8') as f:
                 for line in f:
                     try:rec=json.loads(line)
                     except Exception:continue
+                    event=rec.get('event'); trade_id=str(rec.get('trade_id') or '')
                     rid=rec.get('execution_id')
                     if rid:self.seen_execution_ids.add(str(rid))
                     ts=float(rec.get('ts') or 0)
                     day=time.strftime('%Y-%m-%d',time.gmtime(ts)) if ts else ''
-                    if rec.get('event')=='RISK_DAY_START' and day==today:
+                    if event=='RISK_DAY_START' and day==today:
                         self.day_start_equity=float(rec.get('equity') or 0) or self.day_start_equity
-                    if rec.get('event')=='EXECUTION_FILL' and day==today:
+                    if event=='EXECUTION_FILL' and day==today:
                         self.day_realized+=float(rec.get('net_pnl') or 0)
-                    if rec.get('event')=='TRADE_CLOSE':
+                    if event=='TRADE_CLOSE':
                         closes.append(float(rec.get('realized_pnl') or 0))
+                        if trade_id:open_records.pop(trade_id,None); unresolved.discard(trade_id)
+                    elif rec.get('schema_version')==2 and trade_id and event in ('TRADE_OPEN','PROTECTION_SET','STOP_UPDATE','POSITION_REDUCED'):
+                        open_records[trade_id]=rec
+                    if event=='TRADE_CLOSE_UNRESOLVED' and trade_id:
+                        unresolved.add(trade_id)
             losses=0
             for pnl in reversed(closes):
                 if pnl<0:losses+=1
                 else:break
             self.losses=losses; self.closed_trades=len(closes)
-            logging.info('RISK STATE RESTORED | day_realized=%.6f | day_start_equity=%s | consecutive_losses=%s | seen_executions=%s',
-                         self.day_realized,self.day_start_equity,self.losses,len(self.seen_execution_ids))
+            for trade_id,rec in open_records.items():
+                try:
+                    p=Position(
+                        symbol=rec['symbol'],side=rec['side'],entry=float(rec.get('entry') or rec.get('entry_price')),
+                        qty=float(rec.get('current_qty') or rec.get('qty') or rec.get('entry_qty')),
+                        stop=float(rec.get('stop') or rec.get('sl_price') or 0),
+                        tp1=float(rec.get('tp1') or rec.get('tp1_price') or 0),
+                        tp2=float(rec.get('tp2') or rec.get('tp2_price') or 0),
+                        tp3=float(rec.get('tp3') or rec.get('tp3_price') or 0),
+                        risk=float(rec.get('risk')) if rec.get('risk') is not None else None,
+                    )
+                    p.trade_id=trade_id
+                    for key in ('signal_time','order_time','fill_time','entry_price','entry_qty','tp1_price','tp2_price','tp3_price','sl_price',
+                                'exit_price','exit_time','exit_reason','realized_pnl','fees','mfe_pct','mae_pct','duration_sec','ml_probability','rsi',
+                                'volume_ratio','flow','book','spread','vwap_distance_pct','move1_pct','move3_pct','move5_pct','trade_status',
+                                'entry_fees','exit_fees','initial_qty','current_qty','exit_filled_qty','tp_hits','stop_moved_to_be','tp_order_ids','tp_plan'):
+                        if key in rec:setattr(p,key,rec.get(key))
+                    p.seen_execution_ids=set()
+                    self.pos[p.symbol]=p
+                except Exception:
+                    logging.exception('POSITION STATE RESTORE FAILED | trade_id=%s',trade_id)
+            if unresolved:
+                self.halted=True
+                logging.error('RISK STATE RESTORED | unresolved trade closes=%s | new entries halted',len(unresolved))
+            logging.info('RISK STATE RESTORED | day_realized=%.6f | day_start_equity=%s | consecutive_losses=%s | seen_executions=%s | open_positions=%s',
+                         self.day_realized,self.day_start_equity,self.losses,len(self.seen_execution_ids),len(self.pos))
         except Exception:
             logging.exception('RISK STATE RESTORE FAILED')
 
