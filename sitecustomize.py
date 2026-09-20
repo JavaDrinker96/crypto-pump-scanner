@@ -102,9 +102,12 @@ else:
             model=saved['model']
             prob=float(model.predict_proba(feats)[0,1]); sig.ml_prob=prob
             key='ML_MIN_PROBABILITY_LONG' if sig.side=='long' else 'ML_MIN_PROBABILITY_SHORT'
-            minimum=float(os.getenv(key,'0.55'))
-            logging.info('ML DECISION | %s | side=%s | probability=%.3f | min=%.3f | feature_version=%s | label=%s',
-                         symbol,sig.side,prob,minimum,saved.get('feature_version'),saved.get('label'))
+            calibrated=float((saved.get('thresholds') or {}).get(sig.side,.60))
+            override=os.getenv(key)
+            minimum=float(override) if override not in (None,'') else calibrated
+            source='env' if override not in (None,'') else 'validation'
+            logging.info('ML DECISION | %s | side=%s | probability=%.3f | min=%.3f | threshold_source=%s | feature_version=%s | label=%s',
+                         symbol,sig.side,prob,minimum,source,saved.get('feature_version'),saved.get('label'))
             if not np.isfinite(prob) or prob<minimum:
                 self._diag('ml_rejected')
                 logging.info('ML REJECT | %s | side=%s | probability=%.3f | min=%.3f',symbol,sig.side,prob,minimum)
