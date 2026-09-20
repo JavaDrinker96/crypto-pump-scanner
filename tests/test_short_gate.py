@@ -77,6 +77,7 @@ class ShortConfirmationTests(unittest.TestCase):
     def test_short_confirmation_uses_separate_environment_variable(self):
         with patch.dict(os.environ, {
             'TRADING_ENABLED': 'true',
+            'ML_ENABLED': 'false',
             'SIGNAL_CONFIRM_CYCLES': '1',
             'SHORT_SIGNAL_CONFIRM_CYCLES': '3',
         }):
