@@ -62,6 +62,10 @@ class Engine:
         self.tp1=F('TP1_R',1); self.tp2=F('TP2_R',2); self.tp3=F('TP3_R',3.5); self.tq1=F('TP1_CLOSE_PCT',.35); self.tq2=F('TP2_CLOSE_PCT',.35); self.trail=F('TRAILING_ATR_MULT',1.5); self.sl=F('PUMP_SL_ATR_MULT',1.8); self.ssl=F('SHORT_SL_ATR_MULT',1.5)
         self.confirm=max(1,I('SIGNAL_CONFIRM_CYCLES',2)); self.long_confirm=max(1,I('LONG_SIGNAL_CONFIRM_CYCLES',2)); self.short_confirm=max(1,I('SHORT_SIGNAL_CONFIRM_CYCLES',2)); self.ml=None; self.ml_min=F('ML_MIN_PROBABILITY',.58)
         self.day_realized=0.0; self.day_start_equity=None; self.closed_trades=0; self.seen_execution_ids=set(); self._restore_risk_state()
+        logging.info('STRATEGY CONFIG | schema=2 | long_confirm=%s | short_confirm=%s | long_vol=%.2f | long_m3_min=%.3f%% | long_m5_min=%.3f%% | long_score_min=%.3f | short_m5_min=%.3f%% | short_rsi_min=%.1f | risk_per_trade=%.3f%% | daily_loss_limit=%.3f%% | max_consecutive_losses=%s | leverage=%s',
+                     self.long_confirm,self.short_confirm,self.vol,F('PUMP_LONG_MIN_3M_MOVE_PCT',self.m3*100),F('PUMP_LONG_MIN_5M_MOVE_PCT',0.40),
+                     F('PUMP_LONG_MIN_SCORE',0.45),F('PUMP_SHORT_MIN_5M_MOVE_PCT',0.8),F('PUMP_SHORT_MIN_RSI',65),
+                     self.risk*100,self.dayloss*100,self.maxloss,self.lev)
         path=os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib')
         if B('ML_ENABLED',True) and joblib and os.path.exists(path):
             try:self.ml=joblib.load(path)
@@ -233,7 +237,8 @@ class Engine:
 
     def record_exit_fill(self,net_pnl):
         self._ensure_risk_day()
-        self.day_realized+=float(net_pnl or 0)
+        delta=float(net_pnl or 0)
+        self.day_realized+=delta; self.realized+=delta
 
     def record_trade_close(self,realized_pnl):
         pnl=float(realized_pnl or 0); self.closed_trades+=1
@@ -262,6 +267,8 @@ class Engine:
             self._journal_raw('RISK_BLOCK',{'symbol':s.symbol,'reason':block,'day_realized':self.day_realized,'consecutive_losses':self.losses,'equity':e})
             if self.alert:self.alert(f'🛑 RISK BLOCK | {s.symbol} | {block}')
             return
+        logging.info('RISK SNAPSHOT | symbol=%s | equity=%.6f | day_start_equity=%s | day_realized=%.6f | consecutive_losses=%s/%s | risk_per_trade=%.3f%%',
+                     s.symbol,e,self.day_start_equity,self.day_realized,self.losses,self.maxloss,self.risk*100)
         d=s.atr*(self.ssl if s.side=='short' else self.sl); q=e*self.risk/d if e and d else 0; m=self.c.market(s.symbol); amin=float(((m.get('limits',{}).get('amount') or {}).get('min')) or 0); q=float(self.c.amount_to_precision(s.symbol,max(q,amin)))
         if e<=0 or d<=0:
             logging.warning('ORDER BLOCKED | invalid sizing inputs | symbol=%s | equity=%.4f | atr=%.8f | risk_pct=%.4f',s.symbol,e,s.atr,self.risk)
