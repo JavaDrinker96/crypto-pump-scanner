@@ -117,9 +117,13 @@ def _fee(trade):
 
 def _classify_exit(p,trade):
     info=trade.get('info') or {}
+    order_link=str(info.get('orderLinkId') or '').lower()
     raw=' '.join(str(info.get(k) or '') for k in ('stopOrderType','createType','orderType','execType','orderLinkId')).lower()
     price=float(trade.get('price') or info.get('execPrice') or 0)
     targets={'TP1':float(p.tp1 or 0),'TP2':float(p.tp2 or 0),'TP3':float(p.tp3 or 0),'SL':float(p.stop or 0)}
+    for name in ('TP1','TP2','TP3'):
+        if f'-{name.lower()}' in order_link:
+            return name
     if 'stoploss' in raw or 'stop_loss' in raw:
         return 'SL'
     nearest=min((name for name,val in targets.items() if val>0),key=lambda name:abs(price-targets[name]),default='EXIT')
