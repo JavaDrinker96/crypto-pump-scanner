@@ -167,7 +167,7 @@ class Engine:
                     day=time.strftime('%Y-%m-%d',time.gmtime(ts)) if ts else ''
                     if rec.get('event')=='RISK_DAY_START' and day==today:
                         self.day_start_equity=float(rec.get('equity') or 0) or self.day_start_equity
-                    if rec.get('event')=='EXECUTION_FILL' and rec.get('classification')=='exit' and day==today:
+                    if rec.get('event')=='EXECUTION_FILL' and day==today:
                         self.day_realized+=float(rec.get('net_pnl') or 0)
                     if rec.get('event')=='TRADE_CLOSE':
                         closes.append(float(rec.get('realized_pnl') or 0))
@@ -269,17 +269,17 @@ class Engine:
         p.entry_price=en; p.entry_qty=q
         p.tp1_price=t1; p.tp2_price=t2; p.tp3_price=t3; p.sl_price=stop
         p.tp1_fill_qty=0.0; p.tp2_fill_qty=0.0; p.tp3_fill_qty=0.0
-        p.exit_price=None; p.exit_time=None; p.exit_reason=None; p.realized_pnl=0.0; p.fees=0.0; p.entry_fees=0.0; p.exit_fees=0.0; p.initial_qty=q; p.current_qty=q; p.seen_execution_ids=set(); p.tp_hits=[]; p.stop_moved_to_be=False
+        p.exit_price=None; p.exit_time=None; p.exit_reason=None; p.realized_pnl=0.0; p.fees=0.0; p.entry_fees=0.0; p.exit_fees=0.0; p.initial_qty=q; p.current_qty=q; p.exit_filled_qty=0.0; p.seen_execution_ids=set(); p.tp_hits=[]; p.stop_moved_to_be=False; p.tp_order_ids={}; p.tp_plan={}
         p.mfe_pct=0.0; p.mae_pct=0.0; p.duration_sec=None
         p.ml_probability=s.ml_prob; p.rsi=s.rsi; p.volume_ratio=s.vol; p.flow=s.flow; p.book=s.book; p.spread=s.spread
         p.vwap_distance_pct=s.vwap; p.move1_pct=s.m1; p.move3_pct=s.m3; p.move5_pct=s.move5
         p.trade_status='OPEN'
-        self.journal('TRADE_OPEN',p,{'signal':asdict(s),'order_id':o.get('id')})
+        self.journal('TRADE_OPEN',p,{'schema_version':2,'signal':asdict(s),'order_id':o.get('id')})
     def journal(self,event,p,extra=None):
         path=os.getenv('TRADE_JOURNAL_PATH','data/trades.jsonl')
         os.makedirs(os.path.dirname(path) or '.',exist_ok=True)
         d=asdict(p)
-        for k in ('trade_id','signal_time','order_time','fill_time','entry_price','entry_qty','tp1_price','tp2_price','tp3_price','sl_price','tp1_fill_qty','tp2_fill_qty','tp3_fill_qty','exit_price','exit_time','exit_reason','realized_pnl','fees','mfe_pct','mae_pct','duration_sec','ml_probability','rsi','volume_ratio','flow','book','spread','vwap_distance_pct','move1_pct','move3_pct','move5_pct','trade_status','entry_fees','exit_fees','initial_qty','current_qty','tp_hits','stop_moved_to_be'):
+        for k in ('trade_id','signal_time','order_time','fill_time','entry_price','entry_qty','tp1_price','tp2_price','tp3_price','sl_price','tp1_fill_qty','tp2_fill_qty','tp3_fill_qty','exit_price','exit_time','exit_reason','realized_pnl','fees','mfe_pct','mae_pct','duration_sec','ml_probability','rsi','volume_ratio','flow','book','spread','vwap_distance_pct','move1_pct','move3_pct','move5_pct','trade_status','entry_fees','exit_fees','initial_qty','current_qty','exit_filled_qty','tp_hits','stop_moved_to_be','tp_order_ids','tp_plan'):
             if hasattr(p,k): d[k]=getattr(p,k)
         rec={'ts':time.time(),'event':event,**d,**(extra or {})}
         line=json.dumps(rec,default=str,separators=(',',':'))
