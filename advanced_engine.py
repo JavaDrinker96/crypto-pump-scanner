@@ -194,6 +194,8 @@ class Engine:
                         risk=float(rec.get('risk')) if rec.get('risk') is not None else None,
                     )
                     p.trade_id=trade_id
+                    p.remaining=float(rec.get('remaining') or 1.0)
+                    p.tp1_done=bool(rec.get('tp1_done',False)); p.tp2_done=bool(rec.get('tp2_done',False))
                     for key in ('signal_time','order_time','fill_time','entry_price','entry_qty','tp1_price','tp2_price','tp3_price','sl_price',
                                 'exit_price','exit_time','exit_reason','realized_pnl','fees','mfe_pct','mae_pct','duration_sec','ml_probability','rsi',
                                 'volume_ratio','flow','book','spread','vwap_distance_pct','move1_pct','move3_pct','move5_pct','trade_status',
