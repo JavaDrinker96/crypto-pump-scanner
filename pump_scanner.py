@@ -54,6 +54,8 @@ def validate_live_credentials(x):
 
 def main():
     logging.info('BOOT | telegram_token_set=%s | telegram_chat_set=%s | trading=%s | testnet=%s',bool(TG),bool(CHAT),TRADING,TESTNET)
+    logging.info('BUILD | commit=%s | branch=%s | trade_schema=2',
+                 os.getenv('RAILWAY_GIT_COMMIT_SHA','unknown')[:12],os.getenv('RAILWAY_GIT_BRANCH','unknown'))
     x=create_pump_scanner_from_config();live_ready=validate_live_credentials(x);effective_trading=TRADING and live_ready
     markets=load_public_markets(x)
     symbols=[s for s,m in markets.items() if m.get('active') and m.get('linear') and m.get('swap') and m.get('quote')=='USDT']
