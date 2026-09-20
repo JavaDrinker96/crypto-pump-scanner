@@ -213,6 +213,7 @@ def _finalize_position(self,p):
     risk_usdt=(abs(float(getattr(p,'risk',0) or 0))*initial_qty)
     r_multiple=final_pnl/risk_usdt if risk_usdt>0 else None
     p.realized_pnl=final_pnl; p.exit_time=time.time(); p.duration_sec=p.exit_time-float(getattr(p,'fill_time',p.exit_time)); p.trade_status='CLOSED'
+    p.fees=float(getattr(p,'entry_fees',0) or 0)+float(getattr(p,'exit_fees',0) or 0)
     p.current_qty=0.0
     _cancel_tp_orders(self,p)
     self.record_trade_close(final_pnl)
