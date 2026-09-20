@@ -77,6 +77,24 @@ def triple_barrier_label(rows,i,side,sl_atr_mult,tp_r=1.0,horizon=15):
     return None
 
 
+def calibrate_threshold(prob,y,minimum_samples=10,target_precision=.60):
+    prob=np.asarray(prob,float); y=np.asarray(y,int)
+    minimum_samples=max(1,min(int(minimum_samples),len(y)))
+    candidates=[]
+    for threshold in np.arange(.50,.801,.01):
+        chosen=prob>=threshold; count=int(chosen.sum())
+        if count<minimum_samples:continue
+        precision=float(y[chosen].mean())
+        coverage=float(count/max(len(y),1))
+        candidates.append((float(threshold),precision,coverage,count))
+        if precision>=target_precision:
+            return {'threshold':float(threshold),'precision':precision,'coverage':coverage,'samples':count,'target_met':True}
+    if candidates:
+        best=max(candidates,key=lambda x:(x[1],x[2],-x[0]))
+        return {'threshold':best[0],'precision':best[1],'coverage':best[2],'samples':best[3],'target_met':False}
+    return {'threshold':.60,'precision':0.0,'coverage':0.0,'samples':0,'target_met':False}
+
+
 def train_model(client,path):
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.metrics import roc_auc_score, precision_score
@@ -121,17 +139,25 @@ def train_model(client,path):
     prob=model.predict_proba(xb)[:,1]
     auc=float(roc_auc_score(yb,prob))
     precision=float(precision_score(yb,prob>=.5,zero_division=0))
+    target_precision=float(os.getenv('ML_TARGET_PRECISION','.60'))
+    thresholds={}; threshold_metrics={}
+    for side,side_value in (('long',1.0),('short',-1.0)):
+        mask=xb[:,-1]==side_value
+        min_samples=max(10,int(mask.sum()*.02))
+        calibrated=calibrate_threshold(prob[mask],yb[mask],min_samples,target_precision)
+        thresholds[side]=calibrated['threshold']; threshold_metrics[side]=calibrated
     artifact={
         'model':model,'feature_count':len(FEATURE_NAMES),'feature_names':FEATURE_NAMES,
         'feature_version':FEATURE_VERSION,'label':'triple_barrier_tp_before_sl',
         'tp_r':tp_r,'horizon_candles':horizon,'symbols':symbols,
         'auc':auc,'precision_at_0_5':precision,'validation':'global_chronological_last_25pct',
         'samples':len(samples),'positive_rate':float(y.mean()),
+        'thresholds':thresholds,'threshold_metrics':threshold_metrics,'target_precision':target_precision,
     }
     os.makedirs(os.path.dirname(path) or '.',exist_ok=True)
     joblib.dump(artifact,path)
-    logging.info('ML TRAINED | version=%s | samples=%s | positive_rate=%.3f | train=%s | validation=%s | auc=%.3f | precision@0.5=%.3f | symbols=%s | path=%s',
-                 FEATURE_VERSION,len(y),float(y.mean()),len(ya),len(yb),auc,precision,len(symbols),path)
+    logging.info('ML TRAINED | version=%s | samples=%s | positive_rate=%.3f | train=%s | validation=%s | auc=%.3f | precision@0.5=%.3f | long_threshold=%.3f | short_threshold=%.3f | target_precision=%.3f | symbols=%s | path=%s',
+                 FEATURE_VERSION,len(y),float(y.mean()),len(ya),len(yb),auc,precision,thresholds['long'],thresholds['short'],target_precision,len(symbols),path)
     return artifact
 
 
