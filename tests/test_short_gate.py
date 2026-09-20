@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from advanced_engine import Engine, Signal, short_exhaustion_gate
+class SyncClient:\n    ws_market=None\n    def fetch_positions(self,params=None):return []\n\n\nfrom advanced_engine import Engine, Signal, short_exhaustion_gate
 
 
 class ShortExhaustionGateTests(unittest.TestCase):
@@ -60,7 +60,7 @@ class ShortExhaustionGateTests(unittest.TestCase):
 class ShortConfirmationTests(unittest.TestCase):
     class StubEngine(Engine):
         def __init__(self):
-            super().__init__(client=object(), alert=None)
+            super().__init__(client=SyncClient(), alert=None)
             self.opened = []
 
         def signal(self, symbol):
