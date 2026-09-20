@@ -90,6 +90,14 @@ class ProtectionTests(unittest.TestCase):
 
 
 class ReconciliationTests(unittest.TestCase):
+    def test_order_link_id_preserves_tp_reason_despite_slippage(self):
+        p=Position('X/USDT:USDT','long',100,1,98,102,104,106,2)
+        reason=position_sync._classify_exit(p,{
+            'side':'sell','amount':.35,'price':103.8,
+            'info':{'orderLinkId':'trade-tp1'},
+        })
+        self.assertEqual(reason,'TP1')
+
     def test_private_executions_capture_fees_and_realized_pnl(self):
         client=FakeClient(); engine=DummyEngine(client)
         p=Position('X/USDT:USDT','long',100,1,98,102,104,105,2)
