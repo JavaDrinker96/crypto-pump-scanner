@@ -386,12 +386,12 @@ class Engine:
         p.ml_probability=s.ml_prob; p.rsi=s.rsi; p.volume_ratio=s.vol; p.flow=s.flow; p.book=s.book; p.spread=s.spread
         p.vwap_distance_pct=s.vwap; p.move1_pct=s.m1; p.move3_pct=s.m3; p.move5_pct=s.move5
         p.trade_status='OPEN'
-        self.journal('TRADE_OPEN',p,{'schema_version':2,'signal':asdict(s),'order_id':o.get('id')})
+        self.journal('TRADE_OPEN',p,{'schema_version':3,'signal':asdict(s),'order_id':o.get('id')})
     def journal(self,event,p,extra=None):
         path=os.getenv('TRADE_JOURNAL_PATH','data/trades.jsonl')
         os.makedirs(os.path.dirname(path) or '.',exist_ok=True)
         d=asdict(p)
-        for k in ('trade_id','signal_time','order_time','fill_time','entry_price','entry_qty','tp1_price','tp2_price','tp3_price','sl_price','tp1_fill_qty','tp2_fill_qty','tp3_fill_qty','exit_price','exit_time','exit_reason','realized_pnl','fees','mfe_pct','mae_pct','duration_sec','ml_probability','rsi','volume_ratio','flow','book','spread','vwap_distance_pct','move1_pct','move3_pct','move5_pct','trade_status','entry_fees','exit_fees','initial_qty','current_qty','exit_filled_qty','tp_hits','stop_moved_to_be','tp_order_ids','tp_plan'):
+        for k in ('trade_id','signal_time','order_time','fill_time','entry_price','entry_qty','tp1_price','tp2_price','tp3_price','sl_price','tp1_fill_qty','tp2_fill_qty','tp3_fill_qty','exit_price','exit_time','exit_reason','realized_pnl','fees','mfe_pct','mae_pct','duration_sec','ml_probability','rsi','volume_ratio','flow','book','spread','vwap_distance_pct','move1_pct','move3_pct','move5_pct','trade_status','entry_fees','exit_fees','initial_qty','current_qty','exit_filled_qty','tp_hits','stop_moved_to_be','profit_protected','trailing_armed','trailing_distance','tp_order_ids','tp_plan'):
             if hasattr(p,k): d[k]=getattr(p,k)
         rec={'ts':time.time(),'event':event,**d,**(extra or {})}
         line=json.dumps(rec,default=str,separators=(',',':'))
