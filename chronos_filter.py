@@ -55,6 +55,11 @@ def analyze_quantile_forecast(forecast,entry,risk,side):
     }
 
 
+def _predict_with_current_chronos_api(pipeline,inputs,prediction_length):
+    """Chronos-Bolt 2.x predict accepts the series as the first positional/input arg."""
+    return pipeline.predict(inputs,prediction_length=prediction_length)
+
+
 def accept_forecast(metrics,min_barrier=.20,min_direction=.44,min_mfe_r=.20,max_median_mae_r=1.25):
     checks={
         'barrier_support':float(metrics['barrier_support'])>=float(min_barrier),
@@ -94,7 +99,7 @@ class ChronosForecastFilter:
         started=time.time()
         context=self.torch.tensor(closes,dtype=self.torch.float32)
         with self.torch.no_grad():
-            forecast=self.pipeline.predict(context=context,prediction_length=self.horizon)
+            forecast=_predict_with_current_chronos_api(self.pipeline,context,self.horizon)
         arr=forecast.detach().cpu().numpy()[0]
         risk=float(getattr(sig,'stop_distance',0) or 0) or float(sig.atr)*float(sl_mult)
         metrics=analyze_quantile_forecast(arr,float(sig.price),risk,sig.side)
