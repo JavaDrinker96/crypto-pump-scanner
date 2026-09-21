@@ -3,10 +3,6 @@ import json, os, time, logging, uuid
 from dataclasses import dataclass, asdict
 import numpy as np
 try:
-    import joblib
-except Exception:
-    joblib = None
-try:
     from ccxt.base.errors import RateLimitExceeded, BadRequest
 except Exception:
     RateLimitExceeded = Exception
@@ -82,14 +78,10 @@ class Engine:
         self.tp1=F('TP1_R',1); self.tp2=F('TP2_R',2); self.tp3=F('TP3_R',3.5); self.tq1=F('TP1_CLOSE_PCT',.35); self.tq2=F('TP2_CLOSE_PCT',.35); self.trail=F('TRAILING_ATR_MULT',1.5); self.sl=F('PUMP_SL_ATR_MULT',1.8); self.ssl=F('SHORT_SL_ATR_MULT',1.5)
         self.confirm=max(1,I('SIGNAL_CONFIRM_CYCLES',2)); self.long_confirm=max(1,I('LONG_SIGNAL_CONFIRM_CYCLES',2)); self.short_confirm=max(1,I('SHORT_SIGNAL_CONFIRM_CYCLES',2)); self.ml=None; self.ml_min=F('ML_MIN_PROBABILITY',.58)
         self.day_realized=0.0; self.day_start_equity=None; self.closed_trades=0; self.seen_execution_ids=set(); self._restore_risk_state()
-        logging.info('STRATEGY CONFIG | schema=2 | long_confirm=%s | short_confirm=%s | long_vol=%.2f | long_m3_min=%.3f%% | long_m5_min=%.3f%% | long_rsi_max=%.1f | long_score_min=%.3f | btc_regime=%s | short_m5_min=%.3f%% | short_rsi_min=%.1f | risk_per_trade=%.3f%% | daily_loss_limit=%.3f%% | max_consecutive_losses=%s | leverage=%s',
+        logging.info('STRATEGY CONFIG | schema=3 | long_confirm=%s | short_confirm=%s | long_vol=%.2f | long_m3_min=%.3f%% | long_m5_min=%.3f%% | long_rsi_max=%.1f | long_score_min=%.3f | btc_regime=%s | short_m5_min=%.3f%% | short_rsi_min=%.1f | risk_per_trade=%.3f%% | daily_loss_limit=%.3f%% | max_consecutive_losses=%s | leverage=%s',
                      self.long_confirm,self.short_confirm,F('PUMP_LONG_MIN_VOLUME_RATIO',1.2),F('PUMP_LONG_MIN_3M_MOVE_PCT',0.03),F('PUMP_LONG_MIN_5M_MOVE_PCT',0.10),
                      F('PUMP_LONG_MAX_RSI',72),F('PUMP_LONG_MIN_SCORE',0.0),B('BTC_REGIME_ENABLED',True),F('PUMP_SHORT_MIN_5M_MOVE_PCT',0.8),F('PUMP_SHORT_MIN_RSI',65),
                      self.risk*100,self.dayloss*100,self.maxloss,self.lev)
-        path=os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib')
-        if B('ML_ENABLED',True) and joblib and os.path.exists(path):
-            try:self.ml=joblib.load(path)
-            except Exception:logging.exception('ML model load failed')
     def _diag(self,k): self.diag[k]=self.diag.get(k,0)+1
     def ohlcv(self,s,n=120): return self.c.fetch_ohlcv(s,timeframe=os.getenv('PUMP_TIMEFRAME','1m'),limit=n)
     def rsi(self,c,n=14):
