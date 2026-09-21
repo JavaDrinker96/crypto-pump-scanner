@@ -133,6 +133,8 @@ class AsyncChronosForecastFilter:
         self.evaluator_factory=evaluator_factory or ChronosForecastFilter
         self.load_started=False
         self.load_error=None
+        self.load_failed_at=0.0
+        self.retry_cooldown=max(30,int(os.getenv('CHRONOS_LOAD_RETRY_SEC','300')))
 
     @staticmethod
     def fingerprint(symbol,rows,sig):
@@ -151,7 +153,7 @@ class AsyncChronosForecastFilter:
             return ('ready',result)
         except Exception as exc:
             logging.exception('CHRONOS WORKER FAILED | symbol=%s | side=%s',symbol,sig.side)
-            self.load_error=str(exc)
+            self.load_error=str(exc); self.load_failed_at=time.time()
             return ('error',{'reason':'worker_failed','error':str(exc),'fingerprint':key})
 
     def _collect_done(self):
@@ -173,6 +175,12 @@ class AsyncChronosForecastFilter:
         key=self.fingerprint(symbol,rows,sig)
         now=time.time()
         with self.lock:
+            if self.evaluator is None and self.load_error and now-self.load_failed_at<self.retry_cooldown:
+                return {
+                    'state':'error','reason':'model_load_cooldown','error':self.load_error,
+                    'retry_after_sec':max(0.0,self.retry_cooldown-(now-self.load_failed_at)),
+                    'fingerprint':key,
+                }
             hit=self.results.get(key)
             if hit and now-hit[0]<=self.cache_ttl:
                 _,state,payload=hit
@@ -195,5 +203,10 @@ class AsyncChronosForecastFilter:
             return {
                 'model_id':self.model_id,'loaded':self.evaluator is not None,
                 'load_started':self.load_started,'load_error':self.load_error,
+                'load_failed_at':self.load_failed_at,'retry_cooldown':self.retry_cooldown,
                 'pending':len(self.pending),'cached':len(self.results),
             }
+
+
+    def close(self):
+        self.executor.shutdown(wait=False,cancel_futures=True)
