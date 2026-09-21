@@ -3,9 +3,9 @@ import logging
 import os
 
 try:
-    from chronos_filter import ChronosForecastFilter
+    from chronos_filter import AsyncChronosForecastFilter
 except Exception:
-    ChronosForecastFilter=None
+    AsyncChronosForecastFilter=None
 
 try:
     import advanced_engine
@@ -35,16 +35,15 @@ else:
         self.chronos_required=_enabled('CHRONOS_REQUIRED',os.getenv('ML_REQUIRED','true'))
         enabled=_enabled('CHRONOS_ENABLED',os.getenv('ML_ENABLED','true'))
         if self.ws:logging.info('MARKET DATA | Bybit public WebSocket enabled')
-        if enabled and ChronosForecastFilter:
+        if enabled and AsyncChronosForecastFilter:
             try:
-                self.chronos=ChronosForecastFilter()
+                self.chronos=AsyncChronosForecastFilter()
+                logging.info('CHRONOS STATUS | enabled=true | mode=lazy_async | loaded=false | required=%s | model=%s | max_pending=%s',
+                             self.chronos_required,self.chronos.model_id,self.chronos.max_pending)
             except Exception:
-                logging.exception('CHRONOS LOAD FAILED | trading candidates will be blocked when required')
+                logging.exception('CHRONOS INIT FAILED | trading candidates will be blocked when required')
         if self.chronos is None:
             logging.error('CHRONOS STATUS | enabled=%s | loaded=false | required=%s',enabled,self.chronos_required)
-        else:
-            logging.info('CHRONOS STATUS | enabled=true | loaded=true | required=%s | model=%s',
-                         self.chronos_required,self.chronos.model_id)
 
     def _ws_ohlcv(self,s,n=120):
         if getattr(self,'ws',None):
@@ -77,7 +76,7 @@ else:
         if self.chronos is None:
             if self.chronos_required:
                 self._diag('chronos_unavailable')
-                logging.warning('CHRONOS BLOCK | %s | side=%s | model unavailable',symbol,sig.side)
+                logging.warning('CHRONOS BLOCK | %s | side=%s | async filter unavailable',symbol,sig.side)
                 self._journal_raw('MODEL_DECISION',{
                     'schema_version':3,'symbol':symbol,'side':sig.side,'model':'chronos',
                     'allowed':False,'reason':'model_unavailable',
@@ -87,7 +86,32 @@ else:
         try:
             rows=(getattr(self,'signal_rows_cache',{}) or {}).get(symbol) or self.ohlcv(symbol,120)
             sl_mult=self.ssl if sig.side=='short' else self.sl
-            result=self.chronos.evaluate(symbol,rows,sig,sl_mult)
+            result=self.chronos.request(symbol,rows,sig,sl_mult)
+            state=result.get('state')
+            if state in ('pending','busy'):
+                self._diag('chronos_pending' if state=='pending' else 'chronos_busy')
+                logging.info('CHRONOS %s | %s | side=%s | reason=%s | wait_ms=%.1f',
+                             state.upper(),symbol,sig.side,result.get('reason',''),
+                             float(result.get('wait_ms') or 0))
+                if result.get('reason')=='scheduled':
+                    self._journal_raw('MODEL_PENDING',{
+                        'schema_version':3,'symbol':symbol,'side':sig.side,'model':self.chronos.model_id,
+                        'reason':'scheduled','candle_ts':result.get('fingerprint',[None,None,None])[2],
+                    })
+                return None
+            if state=='error':
+                self._diag('chronos_inference_failed')
+                logging.error('CHRONOS RESULT ERROR | %s | side=%s | error=%s',symbol,sig.side,result.get('error'))
+                self._journal_raw('MODEL_DECISION',{
+                    'schema_version':3,'symbol':symbol,'side':sig.side,'model':self.chronos.model_id,
+                    'allowed':False,'reason':result.get('reason','worker_failed'),'error':result.get('error'),
+                })
+                return None if self.chronos_required else sig
+            if state!='ready':
+                self._diag('chronos_unknown_state')
+                logging.warning('CHRONOS BLOCK | %s | side=%s | unexpected_state=%s',symbol,sig.side,state)
+                return None if self.chronos_required else sig
+
             sig.ml_prob=float(result['barrier_support'])
             payload={
                 'schema_version':3,'symbol':symbol,'side':sig.side,'model':result['model_id'],
@@ -95,23 +119,25 @@ else:
                 'barrier_support':result['barrier_support'],'resolved_support':result['resolved_support'],
                 'direction_support':result['direction_support'],'median_mfe_r':result['median_mfe_r'],
                 'median_mae_r':result['median_mae_r'],'median_terminal_r':result['median_terminal_r'],
-                'latency_ms':result['latency_ms'],'horizon':result['horizon'],'context':result['context'],
+                'latency_ms':result['latency_ms'],'queue_to_result_ms':result.get('queue_to_result_ms'),
+                'horizon':result['horizon'],'context':result['context'],
             }
             self._journal_raw('MODEL_DECISION',payload)
-            logging.info('CHRONOS DECISION | %s | side=%s | allow=%s | barrier=%.3f | direction=%.3f | median_mfe=%.3fR | median_mae=%.3fR | terminal=%.3fR | latency=%.1fms | failed=%s',
+            logging.info('CHRONOS DECISION | %s | side=%s | allow=%s | barrier=%.3f | direction=%.3f | median_mfe=%.3fR | median_mae=%.3fR | terminal=%.3fR | inference=%.1fms | total_worker=%.1fms | failed=%s',
                          symbol,sig.side,result['allowed'],result['barrier_support'],result['direction_support'],
                          result['median_mfe_r'],result['median_mae_r'],result['median_terminal_r'],
-                         result['latency_ms'],','.join(result['failed']) or 'none')
+                         result['latency_ms'],float(result.get('queue_to_result_ms') or result['latency_ms']),
+                         ','.join(result['failed']) or 'none')
             if not result['allowed']:
                 self._diag('chronos_rejected')
                 return None
             return sig
         except Exception:
-            self._diag('chronos_inference_failed')
-            logging.exception('CHRONOS INFERENCE FAILED | %s',symbol)
+            self._diag('chronos_request_failed')
+            logging.exception('CHRONOS REQUEST FAILED | %s',symbol)
             self._journal_raw('MODEL_DECISION',{
                 'schema_version':3,'symbol':symbol,'side':sig.side,'model':'chronos',
-                'allowed':False,'reason':'inference_failed',
+                'allowed':False,'reason':'request_failed',
             })
             if self.chronos_required:return None
             return sig
@@ -156,4 +182,4 @@ else:
     advanced_engine.Engine.signal=_patched_signal
     advanced_engine.Engine.open=_open_with_protection
     advanced_engine.Engine.manage=lambda self:None
-    logging.info('RUNTIME PATCH | WS market data + pretrained Chronos-Bolt filter + fail-closed inference + native protection hook')
+    logging.info('RUNTIME PATCH | WS market data + lazy async Chronos-Bolt filter + fail-closed inference + native protection hook')
