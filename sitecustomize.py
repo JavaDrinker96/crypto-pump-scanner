@@ -1,14 +1,11 @@
-"""Runtime patch: consistent ML inference, Bybit WS market data and native protection."""
+"""Runtime patch: Bybit WS market data, pretrained Chronos filter and native protection."""
 import logging
 import os
 
 try:
-    import joblib
-    import numpy as np
-    from ml_pipeline import compatible, signal_features, train_model
+    from chronos_filter import ChronosForecastFilter
 except Exception:
-    joblib=np=None
-    compatible=signal_features=train_model=None
+    ChronosForecastFilter=None
 
 try:
     import advanced_engine
@@ -22,44 +19,32 @@ else:
     _flow=advanced_engine.Engine.flow
     _book=advanced_engine.Engine.book
 
-    def _path():
-        return os.getenv('ML_MODEL_PATH','data/models/pump_classifier.joblib')
+    def _enabled(name,default='true'):
+        return os.getenv(name,default).lower() in ('1','true','yes','on')
 
     def _notify(self,text):
         try:
             if self.alert:self.alert(text)
         except Exception:
-            logging.exception('ML ALERT FAILED | %s',text)
+            logging.exception('ALERT FAILED | %s',text)
 
     def _patched_init(self,client,alert=None):
         _init(self,client,alert)
-        self.ml_required=os.getenv('ML_REQUIRED','true').lower() in ('1','true','yes','on')
-        enabled=os.getenv('ML_ENABLED','true').lower() in ('1','true','yes','on')
-        path=_path(); self.ws=getattr(client,'ws_market',None); self.ml=None
+        self.ws=getattr(client,'ws_market',None)
+        self.chronos=None
+        self.chronos_required=_enabled('CHRONOS_REQUIRED',os.getenv('ML_REQUIRED','true'))
+        enabled=_enabled('CHRONOS_ENABLED',os.getenv('ML_ENABLED','true'))
         if self.ws:logging.info('MARKET DATA | Bybit public WebSocket enabled')
-        if enabled and joblib and compatible:
+        if enabled and ChronosForecastFilter:
             try:
-                if os.path.exists(path):
-                    candidate=joblib.load(path)
-                    if compatible(candidate):
-                        self.ml=candidate
-                    else:
-                        logging.warning('ML MODEL INCOMPATIBLE | retraining required | path=%s',path)
+                self.chronos=ChronosForecastFilter()
             except Exception:
-                logging.exception('ML MODEL LOAD FAILED | retraining')
-            if self.ml is None and os.getenv('ML_AUTO_TRAIN','true').lower() in ('1','true','yes','on'):
-                try:
-                    self.ml=train_model(client,path)
-                    logging.info('ML STATUS | enabled=true | loaded=true | source=auto-trained | version=%s | label=%s | path=%s',
-                                 self.ml.get('feature_version'),self.ml.get('label'),path)
-                except Exception:
-                    logging.exception('ML AUTO TRAIN FAILED | trading remains blocked')
-        if self.ml is None:
-            logging.error('ML STATUS | enabled=%s | loaded=false | required=%s | path=%s',enabled,self.ml_required,path)
+                logging.exception('CHRONOS LOAD FAILED | trading candidates will be blocked when required')
+        if self.chronos is None:
+            logging.error('CHRONOS STATUS | enabled=%s | loaded=false | required=%s',enabled,self.chronos_required)
         else:
-            logging.info('ML STATUS | enabled=true | loaded=true | version=%s | label=%s | auc=%s | precision_at_0_5=%s | samples=%s | path=%s',
-                         self.ml.get('feature_version'),self.ml.get('label'),self.ml.get('auc'),
-                         self.ml.get('precision_at_0_5'),self.ml.get('samples'),path)
+            logging.info('CHRONOS STATUS | enabled=true | loaded=true | required=%s | model=%s',
+                         self.chronos_required,self.chronos.model_id)
 
     def _ws_ohlcv(self,s,n=120):
         if getattr(self,'ws',None):
@@ -89,37 +74,47 @@ else:
     def _patched_signal(self,symbol):
         sig=_signal(self,symbol)
         if sig is None:return None
-        saved=self.ml
-        if self.ml_required and saved is None:
-            self._diag('ml_unavailable')
-            logging.warning('ML BLOCK | %s | no compatible triple-barrier model',symbol)
-            _notify(self,f'🟠 ML BLOCK | {symbol} | no compatible model')
-            return None
-        if saved is None:
+        if self.chronos is None:
+            if self.chronos_required:
+                self._diag('chronos_unavailable')
+                logging.warning('CHRONOS BLOCK | %s | side=%s | model unavailable',symbol,sig.side)
+                self._journal_raw('MODEL_DECISION',{
+                    'schema_version':3,'symbol':symbol,'side':sig.side,'model':'chronos',
+                    'allowed':False,'reason':'model_unavailable',
+                })
+                return None
             return sig
         try:
-            feats=signal_features(sig)
-            model=saved['model']
-            prob=float(model.predict_proba(feats)[0,1]); sig.ml_prob=prob
-            key='ML_MIN_PROBABILITY_LONG' if sig.side=='long' else 'ML_MIN_PROBABILITY_SHORT'
-            calibrated=float((saved.get('thresholds') or {}).get(sig.side,.60))
-            override=os.getenv(key)
-            minimum=float(override) if override not in (None,'') else calibrated
-            source='env' if override not in (None,'') else 'validation'
-            logging.info('ML DECISION | %s | side=%s | probability=%.3f | min=%.3f | threshold_source=%s | feature_version=%s | label=%s',
-                         symbol,sig.side,prob,minimum,source,saved.get('feature_version'),saved.get('label'))
-            if not np.isfinite(prob) or prob<minimum:
-                self._diag('ml_rejected')
-                logging.info('ML REJECT | %s | side=%s | probability=%.3f | min=%.3f',symbol,sig.side,prob,minimum)
+            rows=(getattr(self,'signal_rows_cache',{}) or {}).get(symbol) or self.ohlcv(symbol,120)
+            sl_mult=self.ssl if sig.side=='short' else self.sl
+            result=self.chronos.evaluate(symbol,rows,sig,sl_mult)
+            sig.ml_prob=float(result['barrier_support'])
+            payload={
+                'schema_version':3,'symbol':symbol,'side':sig.side,'model':result['model_id'],
+                'allowed':result['allowed'],'failed':result['failed'],
+                'barrier_support':result['barrier_support'],'resolved_support':result['resolved_support'],
+                'direction_support':result['direction_support'],'median_mfe_r':result['median_mfe_r'],
+                'median_mae_r':result['median_mae_r'],'median_terminal_r':result['median_terminal_r'],
+                'latency_ms':result['latency_ms'],'horizon':result['horizon'],'context':result['context'],
+            }
+            self._journal_raw('MODEL_DECISION',payload)
+            logging.info('CHRONOS DECISION | %s | side=%s | allow=%s | barrier=%.3f | direction=%.3f | median_mfe=%.3fR | median_mae=%.3fR | terminal=%.3fR | latency=%.1fms | failed=%s',
+                         symbol,sig.side,result['allowed'],result['barrier_support'],result['direction_support'],
+                         result['median_mfe_r'],result['median_mae_r'],result['median_terminal_r'],
+                         result['latency_ms'],','.join(result['failed']) or 'none')
+            if not result['allowed']:
+                self._diag('chronos_rejected')
                 return None
-            logging.info('ML ACCEPT | %s | side=%s | probability=%.3f | min=%.3f',symbol,sig.side,prob,minimum)
-            _notify(self,f'✅ ML ACCEPT | {symbol} | side={sig.side.upper()} | probability={prob:.3f} | min={minimum:.3f}')
             return sig
         except Exception:
-            self._diag('ml_inference_failed')
-            logging.exception('ML INFERENCE FAILED | %s',symbol)
-            _notify(self,f'🔴 ML INFERENCE FAILED | {symbol}')
-            return None
+            self._diag('chronos_inference_failed')
+            logging.exception('CHRONOS INFERENCE FAILED | %s',symbol)
+            self._journal_raw('MODEL_DECISION',{
+                'schema_version':3,'symbol':symbol,'side':sig.side,'model':'chronos',
+                'allowed':False,'reason':'inference_failed',
+            })
+            if self.chronos_required:return None
+            return sig
 
     def _protect(self,p):
         """Fallback protection. position_sync replaces this with exact managed protection."""
@@ -161,4 +156,4 @@ else:
     advanced_engine.Engine.signal=_patched_signal
     advanced_engine.Engine.open=_open_with_protection
     advanced_engine.Engine.manage=lambda self:None
-    logging.info('RUNTIME PATCH | WS market data + triple-barrier ML + fail-closed inference + native protection hook')
+    logging.info('RUNTIME PATCH | WS market data + pretrained Chronos-Bolt filter + fail-closed inference + native protection hook')
