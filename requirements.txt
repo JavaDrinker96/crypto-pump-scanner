@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 ccxt>=4.0.0
 numpy>=1.24.0
 requests>=2.31.0
@@ -5,4 +6,5 @@ python-dotenv>=1.0.0
 websocket-client>=1.8.0
 pysocks
 requests[socks]
+torch==2.14.0
 chronos-forecasting==2.3.2
