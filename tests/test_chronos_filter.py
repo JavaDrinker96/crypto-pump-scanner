@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from chronos_filter import AsyncChronosForecastFilter, analyze_quantile_forecast, accept_forecast
+from chronos_filter import AsyncChronosForecastFilter, _predict_with_current_chronos_api, analyze_quantile_forecast, accept_forecast
 
 
 class ChronosForecastAnalysisTests(unittest.TestCase):
@@ -165,3 +165,19 @@ class AsyncChronosTests(unittest.TestCase):
                 self.assertEqual(cooldown['reason'],'model_load_cooldown')
             finally:
                 filt.close()
+
+
+
+class ChronosApiCompatibilityTests(unittest.TestCase):
+    def test_predict_uses_inputs_not_context_keyword(self):
+        class StrictPipeline:
+            def __init__(self):
+                self.seen=None
+            def predict(self,inputs,prediction_length=None):
+                self.seen=(inputs,prediction_length)
+                return 'ok'
+
+        pipeline=StrictPipeline()
+        result=_predict_with_current_chronos_api(pipeline,'series',15)
+        self.assertEqual(result,'ok')
+        self.assertEqual(pipeline.seen,('series',15))
