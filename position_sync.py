@@ -124,6 +124,8 @@ def _classify_exit(p,trade):
     for name in ('TP1','TP2','TP3'):
         if f'-{name.lower()}' in order_link:
             return name
+    if 'trailingstop' in raw or 'trailing_stop' in raw:
+        return 'TRAILING_SL'
     if 'stoploss' in raw or 'stop_loss' in raw:
         return 'SL'
     nearest=min((name for name,val in targets.items() if val>0),key=lambda name:abs(price-targets[name]),default='EXIT')
@@ -201,14 +203,69 @@ def _reconcile_executions(self,p):
     return added_exit_qty
 
 
-def _maybe_move_stop(self,p,remaining):
-    if remaining<=0 or not getattr(p,'tp1_done',False) or getattr(p,'stop_moved_to_be',False):return
-    new_stop=breakeven_stop(
-        p.entry,p.side,p.stop,float(os.getenv('BREAKEVEN_FEE_BUFFER_PCT','.06'))
-    )
-    _set_full_stop(self,p,new_stop,'tp1_breakeven')
-    p.stop_moved_to_be=True
-    logging.info('BREAKEVEN ARMED | %s | remaining=%s | stop=%s',p.symbol,remaining,new_stop)
+def _stop_improves(p,candidate):
+    current=float(getattr(p,'stop',0) or 0)
+    return candidate>current if p.side=='long' else candidate<current
+
+
+def _set_native_trailing(self,p,mark,distance):
+    try:
+        distance=float(self.c.price_to_precision(p.symbol,distance))
+    except Exception:
+        distance=float(distance)
+    if distance<=0:raise ValueError('trailing distance must be positive')
+    params={
+        'category':'linear','symbol':_market_id(self.c,p.symbol),'positionIdx':0,
+        'tpslMode':'Full','stopLoss':str(p.stop),'slOrderType':'Market','slTriggerBy':'MarkPrice',
+        'trailingStop':str(distance),
+    }
+    result=self.c.request('v5/position/trading-stop','private','POST',params)
+    if not isinstance(result,dict) or result.get('retCode',0)!=0:
+        raise RuntimeError(f'Bybit trailing stop update failed: {result}')
+    p.trailing_armed=True; p.trailing_distance=distance
+    logging.info('TRAILING ARMED | %s | mark=%s | distance=%s | atr_mult=%s | hard_stop=%s',
+                 p.symbol,mark,distance,getattr(self,'trail',None),p.stop)
+    self.journal('TRAILING_ARMED',p,{
+        'schema_version':3,'mark':float(mark),'distance':distance,
+        'atr_mult':float(getattr(self,'trail',0) or 0),'hard_stop':float(p.stop),
+    })
+
+
+def _manage_dynamic_protection(self,p,remaining,mark):
+    if remaining<=0 or not mark:return
+    direction=1 if p.side=='long' else -1
+    risk=max(abs(float(getattr(p,'risk',0) or 0)),1e-12)
+    current_r=direction*(float(mark)-float(p.entry))/risk
+
+    if not getattr(p,'tp1_done',False) and not getattr(p,'profit_protected',False):
+        trigger=float(os.getenv('PROFIT_PROTECT_TRIGGER_R','.50'))
+        stop_r=float(os.getenv('PROFIT_PROTECT_STOP_R','-.10'))
+        if current_r>=trigger:
+            candidate=float(p.entry)+direction*risk*stop_r
+            if _stop_improves(p,candidate):
+                _set_full_stop(self,p,candidate,'profit_protect')
+            p.profit_protected=True
+            logging.info('PROFIT PROTECT ARMED | %s | current=%.3fR | trigger=%.3fR | stop_target=%.3fR | stop=%s',
+                         p.symbol,current_r,trigger,stop_r,p.stop)
+            self.journal('PROFIT_PROTECT_ARMED',p,{
+                'schema_version':3,'current_r':current_r,'trigger_r':trigger,'stop_r':stop_r,
+            })
+
+    if getattr(p,'tp1_done',False) and not getattr(p,'stop_moved_to_be',False):
+        new_stop=breakeven_stop(
+            p.entry,p.side,p.stop,float(os.getenv('BREAKEVEN_FEE_BUFFER_PCT','.06'))
+        )
+        if _stop_improves(p,new_stop):
+            _set_full_stop(self,p,new_stop,'tp1_breakeven')
+        p.stop_moved_to_be=True
+        logging.info('BREAKEVEN ARMED | %s | remaining=%s | stop=%s',p.symbol,remaining,p.stop)
+
+    trailing_after=max(0,int(os.getenv('TRAILING_AFTER_TP','2')))
+    if trailing_after and getattr(p,'tp2_done',False) and not getattr(p,'trailing_armed',False):
+        rows=self.ohlcv(p.symbol,30)
+        atr=float(self.atr(rows))
+        distance=atr*float(os.getenv('TRAILING_ATR_MULT',str(getattr(self,'trail',1.5))))
+        _set_native_trailing(self,p,mark,distance)
 
 
 def _finalize_position(self,p):
@@ -271,7 +328,7 @@ def sync(self):
             if old and abs(size-old)/old>0.005:
                 logging.info('POSITION SYNC | symbol=%s | local_qty=%s | exchange_qty=%s',symbol,old,size)
                 self.journal('POSITION_REDUCED',p,{'schema_version':2,'old_qty':old,'exchange_qty':size})
-            _maybe_move_stop(self,p,size)
+            _manage_dynamic_protection(self,p,size,mark)
         else:
             _reconcile_executions(self,p)
             expected=float(getattr(p,'initial_qty',0) or getattr(p,'entry_qty',0) or 0)
