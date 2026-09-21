@@ -2,6 +2,8 @@
 import logging
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -64,6 +66,7 @@ def accept_forecast(metrics,min_barrier=.20,min_direction=.44,min_mfe_r=.20,max_
 
 
 class ChronosForecastFilter:
+    """Synchronous evaluator used only inside the dedicated Chronos worker."""
     def __init__(self):
         import torch
         from chronos import BaseChronosPipeline
@@ -72,8 +75,6 @@ class ChronosForecastFilter:
         self.model_id=os.getenv('CHRONOS_MODEL_ID','amazon/chronos-bolt-tiny')
         self.context=max(32,int(os.getenv('CHRONOS_CONTEXT_LENGTH','120')))
         self.horizon=max(3,int(os.getenv('CHRONOS_FORECAST_HORIZON','15')))
-        self.cache_ttl=max(1,int(os.getenv('CHRONOS_SIGNAL_CACHE_SEC','20')))
-        self.cache={}
         cache_dir=os.getenv('HF_HOME','/app/data/models/huggingface')
         os.makedirs(cache_dir,exist_ok=True)
         started=time.time()
@@ -87,10 +88,6 @@ class ChronosForecastFilter:
                      self.model_id,self.context,self.horizon,time.time()-started,cache_dir)
 
     def evaluate(self,symbol,rows,sig,sl_mult):
-        now=time.time(); key=(symbol,sig.side)
-        hit=self.cache.get(key)
-        if hit and now-hit[0]<self.cache_ttl:
-            return hit[1]
         closes=np.asarray([float(z[4]) for z in rows[-self.context:]],dtype=np.float32)
         if len(closes)<32:
             raise RuntimeError(f'insufficient Chronos context: {len(closes)}')
@@ -108,11 +105,96 @@ class ChronosForecastFilter:
             float(os.getenv('CHRONOS_MIN_MEDIAN_MFE_R','.20')),
             float(os.getenv('CHRONOS_MAX_MEDIAN_MAE_R','1.25')),
         )
-        result={
+        return {
             **metrics,'allowed':bool(allowed),
             'failed':[k for k,v in checks.items() if not v],
             'latency_ms':(time.time()-started)*1000,
             'model_id':self.model_id,'horizon':self.horizon,'context':len(closes),
         }
-        self.cache[key]=(now,result)
-        return result
+
+
+class AsyncChronosForecastFilter:
+    """Non-blocking, fail-closed Chronos gate.
+
+    A forecast is scheduled only after the structural strategy produces a final
+    candidate. The scanner never waits for model loading or inference. Results
+    are accepted only for the same symbol/side/candle fingerprint and expire
+    quickly. Queue size is bounded so a burst of candidates cannot stall CPU.
+    """
+    def __init__(self,evaluator_factory=None):
+        self.model_id=os.getenv('CHRONOS_MODEL_ID','amazon/chronos-bolt-tiny')
+        self.cache_ttl=max(5,int(os.getenv('CHRONOS_SIGNAL_CACHE_SEC','45')))
+        self.max_pending=max(1,int(os.getenv('CHRONOS_MAX_PENDING','2')))
+        self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix='chronos')
+        self.lock=threading.Lock()
+        self.pending={}
+        self.results={}
+        self.evaluator=None
+        self.evaluator_factory=evaluator_factory or ChronosForecastFilter
+        self.load_started=False
+        self.load_error=None
+
+    @staticmethod
+    def fingerprint(symbol,rows,sig):
+        candle_ts=int(float(rows[-1][0])) if rows else 0
+        risk=float(getattr(sig,'stop_distance',0) or 0)
+        return (str(symbol),str(sig.side),candle_ts,round(float(sig.price),10),round(risk,10))
+
+    def _evaluate_job(self,key,symbol,rows,sig,sl_mult):
+        started=time.time()
+        try:
+            if self.evaluator is None:
+                self.load_started=True
+                self.evaluator=self.evaluator_factory()
+                self.model_id=getattr(self.evaluator,'model_id',self.model_id)
+            result=self.evaluator.evaluate(symbol,rows,sig,sl_mult)
+            result={**result,'queue_to_result_ms':(time.time()-started)*1000,'fingerprint':key}
+            return ('ready',result)
+        except Exception as exc:
+            logging.exception('CHRONOS WORKER FAILED | symbol=%s | side=%s',symbol,sig.side)
+            self.load_error=str(exc)
+            return ('error',{'reason':'worker_failed','error':str(exc),'fingerprint':key})
+
+    def _collect_done(self):
+        now=time.time()
+        with self.lock:
+            for key,(submitted,future) in list(self.pending.items()):
+                if not future.done():continue
+                try:state,payload=future.result()
+                except Exception as exc:
+                    state,payload='error',{'reason':'future_failed','error':str(exc),'fingerprint':key}
+                self.results[key]=(now,state,payload)
+                self.pending.pop(key,None)
+            for key,(created,_,_) in list(self.results.items()):
+                if now-created>self.cache_ttl:
+                    self.results.pop(key,None)
+
+    def request(self,symbol,rows,sig,sl_mult):
+        self._collect_done()
+        key=self.fingerprint(symbol,rows,sig)
+        now=time.time()
+        with self.lock:
+            hit=self.results.get(key)
+            if hit and now-hit[0]<=self.cache_ttl:
+                _,state,payload=hit
+                return {'state':state,**payload}
+            if key in self.pending:
+                submitted,_=self.pending[key]
+                return {'state':'pending','reason':'inference_pending','wait_ms':(now-submitted)*1000,'fingerprint':key}
+            if len(self.pending)>=self.max_pending:
+                return {'state':'busy','reason':'queue_full','pending_count':len(self.pending),'fingerprint':key}
+            snapshot=[list(z) for z in rows]
+            future=self.executor.submit(self._evaluate_job,key,symbol,snapshot,sig,sl_mult)
+            self.pending[key]=(now,future)
+            logging.info('CHRONOS QUEUED | symbol=%s | side=%s | candle_ts=%s | pending=%s/%s',
+                         symbol,sig.side,key[2],len(self.pending),self.max_pending)
+            return {'state':'pending','reason':'scheduled','wait_ms':0.0,'fingerprint':key}
+
+    def status(self):
+        self._collect_done()
+        with self.lock:
+            return {
+                'model_id':self.model_id,'loaded':self.evaluator is not None,
+                'load_started':self.load_started,'load_error':self.load_error,
+                'pending':len(self.pending),'cached':len(self.results),
+            }
