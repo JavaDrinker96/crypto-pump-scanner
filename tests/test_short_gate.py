@@ -2,6 +2,11 @@ import os
 import unittest
 from unittest.mock import patch
 
+class SyncClient:
+    ws_market=None
+    def fetch_positions(self,params=None):return []
+
+
 from advanced_engine import Engine, Signal, short_exhaustion_gate
 
 
@@ -60,7 +65,7 @@ class ShortExhaustionGateTests(unittest.TestCase):
 class ShortConfirmationTests(unittest.TestCase):
     class StubEngine(Engine):
         def __init__(self):
-            super().__init__(client=object(), alert=None)
+            super().__init__(client=SyncClient(), alert=None)
             self.opened = []
 
         def signal(self, symbol):
@@ -77,6 +82,7 @@ class ShortConfirmationTests(unittest.TestCase):
     def test_short_confirmation_uses_separate_environment_variable(self):
         with patch.dict(os.environ, {
             'TRADING_ENABLED': 'true',
+            'ML_ENABLED': 'false',
             'SIGNAL_CONFIRM_CYCLES': '1',
             'SHORT_SIGNAL_CONFIRM_CYCLES': '3',
         }):
