@@ -137,8 +137,7 @@ class AsyncChronosForecastFilter:
     @staticmethod
     def fingerprint(symbol,rows,sig):
         candle_ts=int(float(rows[-1][0])) if rows else 0
-        risk=float(getattr(sig,'stop_distance',0) or 0)
-        return (str(symbol),str(sig.side),candle_ts,round(float(sig.price),10),round(risk,10))
+        return (str(symbol),str(sig.side),candle_ts)
 
     def _evaluate_job(self,key,symbol,rows,sig,sl_mult):
         started=time.time()
