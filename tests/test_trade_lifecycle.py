@@ -40,6 +40,9 @@ class FakeClient:
     def fetch_my_trades(self,symbol,since=None,limit=None,params=None):
         return list(self.trades)
 
+    def price_to_precision(self,symbol,value):
+        return f'{float(value):.4f}'
+
 
 class DummyEngine:
     def __init__(self,client):
@@ -48,12 +51,19 @@ class DummyEngine:
         self.day_realized=0.0
         self.journal=Mock()
         self.raw=[]
+        self.trail=1.5
 
     def _journal_raw(self,event,payload):
         self.raw.append((event,payload))
 
     def record_exit_fill(self,value):
         self.day_realized+=value
+
+    def ohlcv(self,symbol,n=30):
+        return [[i*60000,100,101,99,100,1000] for i in range(max(30,n))]
+
+    def atr(self,rows,n=14):
+        return 2.0
 
 
 class ProtectionTests(unittest.TestCase):
@@ -75,21 +85,57 @@ class ProtectionTests(unittest.TestCase):
             self.assertTrue(order[5]['closeOnTrigger'])
             self.assertEqual(order[5]['triggerBy'],'MarkPrice')
 
+    def test_half_r_protection_reduces_max_loss_before_tp1(self):
+        client=FakeClient(); engine=DummyEngine(client)
+        p=Position('X/USDT:USDT','long',100,1,98,102,104,106,2)
+        p.trade_id='x'; p.tp1_done=False; p.stop_moved_to_be=False
+        p.profit_protected=False; p.trailing_armed=False; p.sl_price=98
+        with patch.dict(os.environ,{
+            'PROFIT_PROTECT_TRIGGER_R':'.50','PROFIT_PROTECT_STOP_R':'-.10',
+            'TRAILING_AFTER_TP':'2'
+        }):
+            position_sync._manage_dynamic_protection(engine,p,1,101)
+        self.assertTrue(p.profit_protected)
+        self.assertAlmostEqual(p.stop,99.8)
+        self.assertEqual(client.requests[-1][3]['stopLoss'],str(p.stop))
+
     def test_tp1_moves_full_stop_to_break_even_buffer(self):
         client=FakeClient(); engine=DummyEngine(client)
-        p=Position('X/USDT:USDT','long',100,1,98,101,102,103,2)
-        p.trade_id='x'; p.tp1_done=True; p.stop_moved_to_be=False
-        p.sl_price=98
+        p=Position('X/USDT:USDT','long',100,1,98,102,104,106,2)
+        p.trade_id='x'; p.tp1_done=True; p.tp2_done=False; p.stop_moved_to_be=False
+        p.profit_protected=False; p.trailing_armed=False; p.sl_price=98
         engine.journal=Mock()
-        with patch.dict(os.environ,{'BREAKEVEN_FEE_BUFFER_PCT':'.06'}):
-            position_sync._maybe_move_stop(engine,p,.65)
+        with patch.dict(os.environ,{'BREAKEVEN_FEE_BUFFER_PCT':'.06','TRAILING_AFTER_TP':'2'}):
+            position_sync._manage_dynamic_protection(engine,p,.65,102)
         self.assertTrue(p.stop_moved_to_be)
         self.assertAlmostEqual(p.stop,100.06)
         self.assertEqual(client.requests[-1][3]['tpslMode'],'Full')
         self.assertEqual(client.requests[-1][3]['stopLoss'],str(p.stop))
 
+    def test_tp2_arms_native_trailing_stop(self):
+        client=FakeClient(); engine=DummyEngine(client)
+        p=Position('X/USDT:USDT','long',100,1,100.06,102,104,106,2)
+        p.trade_id='x'; p.tp1_done=True; p.tp2_done=True; p.stop_moved_to_be=True
+        p.profit_protected=True; p.trailing_armed=False; p.sl_price=100.06
+        with patch.dict(os.environ,{'TRAILING_AFTER_TP':'2','TRAILING_ATR_MULT':'1.5'}):
+            position_sync._manage_dynamic_protection(engine,p,.30,104.5)
+        self.assertTrue(p.trailing_armed)
+        self.assertAlmostEqual(p.trailing_distance,3.0)
+        params=client.requests[-1][3]
+        self.assertEqual(params['tpslMode'],'Full')
+        self.assertEqual(params['trailingStop'],'3.0')
+        self.assertEqual(params['stopLoss'],str(p.stop))
+
 
 class ReconciliationTests(unittest.TestCase):
+    def test_trailing_fill_is_classified(self):
+        p=Position('X/USDT:USDT','long',100,1,100.06,102,104,106,2)
+        reason=position_sync._classify_exit(p,{
+            'side':'sell','amount':.3,'price':104.2,
+            'info':{'stopOrderType':'TrailingStop'},
+        })
+        self.assertEqual(reason,'TRAILING_SL')
+
     def test_order_link_id_preserves_tp_reason_despite_slippage(self):
         p=Position('X/USDT:USDT','long',100,1,98,102,104,106,2)
         reason=position_sync._classify_exit(p,{
