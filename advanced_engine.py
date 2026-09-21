@@ -16,8 +16,27 @@ F=lambda k,d: float(os.getenv(k,d))
 I=lambda k,d: int(os.getenv(k,d))
 B=lambda k,d: os.getenv(k,str(d)).lower() in ('1','true','yes','on')
 
+def volume_activity_ratio(rows, now_ms=None):
+    if len(rows)<23:return 0.0
+    vols=np.asarray([float(z[5]) for z in rows],float)
+    baseline=float(vols[-22:-2].mean())
+    if baseline<=1e-12:return 0.0
+    now_ms=float(now_ms if now_ms is not None else time.time()*1000)
+    candle_start=float(rows[-1][0])
+    elapsed=max(.15,min(1.0,(now_ms-candle_start)/60000.0))
+    projected_current=float(vols[-1])/elapsed
+    return max(projected_current,float(vols[-2]))/baseline
+
+def btc_regime_gate(ret15_pct,ret30_pct,side,long_min_15=-0.15,long_min_30=-0.05,
+                    short_max_15=0.15,short_max_30=0.05):
+    if side=='long':
+        checks={'btc_15m':ret15_pct>=long_min_15,'btc_30m':ret30_pct>=long_min_30}
+    else:
+        checks={'btc_15m':ret15_pct<=short_max_15,'btc_30m':ret30_pct<=short_max_30}
+    return all(checks.values()),checks
+
 def long_continuation_gate(m1,m3,m5,rsi,volume_ratio,breakout,green_count,vwap_distance,vol_threshold,
-                           min_m3_pct=0.30,min_m5_pct=0.40,min_rsi=52,max_rsi=78,
+                           min_m3_pct=0.03,min_m5_pct=0.10,min_rsi=52,max_rsi=72,
                            max_vwap_pct=3.0,max_m5_pct=6.0):
     checks={
         'volume':volume_ratio>=vol_threshold,
@@ -47,7 +66,7 @@ def short_exhaustion_gate(m1,m3,m5,rsi,volume_ratio,reversal,vwap_distance,vol_t
 
 @dataclass
 class Signal:
-    symbol:str; side:str; price:float; atr:float; rsi:float; vol:float; flow:float; book:float; vwap:float; move5:float; score:float; reason:str; m1:float=0.; m3:float=0.; spread:float=0.; ml_prob:float=0.
+    symbol:str; side:str; price:float; atr:float; rsi:float; vol:float; flow:float; book:float; vwap:float; move5:float; score:float; reason:str; m1:float=0.; m3:float=0.; spread:float=0.; ml_prob:float=0.; stop_distance:float=0.
 @dataclass
 class Position:
     symbol:str; side:str; entry:float; qty:float; stop:float; tp1:float; tp2:float; tp3:float; risk:float | None; remaining:float=1.; tp1_done:bool=False; tp2_done:bool=False
@@ -56,15 +75,16 @@ class Engine:
     def __init__(self,client,alert=None):
         self.c=client; self.alert=alert; self.pos={}; self.realized=0.; self.losses=0; self.halted=False
         self.day=time.strftime('%Y-%m-%d',time.gmtime()); self.day_start=None; self.pending={}; self.flow_cache={}; self.book_cache={}; self.flow_book_ttl=max(5,I('PUMP_FLOW_BOOK_CACHE_SEC',20)); self.diag={}
+        self.btc_regime_cache=None; self.signal_rows_cache={}
         self.vol=F('PUMP_VOL_SPIKE_MULT',1.4); self.minvol=F('PUMP_MIN_DOLLAR_VOL',5e6); self.m1=F('PUMP_MIN_1M_MOVE_PCT',.0015); self.m3=F('PUMP_MIN_3M_MOVE_PCT',.003); self.m5=F('PUMP_MAX_5M_MOVE_PCT',.060); self.brk=I('PUMP_BREAKOUT_LOOKBACK',10); self.long_momentum=I('PUMP_LONG_MIN_MOMENTUM',2)
         self.rmin=F('PUMP_MIN_RSI_ENTRY',52); self.rmax=F('PUMP_MAX_RSI_ENTRY',80); self.flowmin=F('PUMP_MIN_BUY_RATIO',.56); self.bookmin=F('PUMP_MIN_BOOK_IMBALANCE',.54); self.spread=F('MAX_SPREAD_PCT',.15); self.depth=F('ORDERBOOK_DEPTH_PCT',1)
         self.risk=F('MAX_RISK_PER_TRADE_PCT',.5)/100; self.dayloss=F('MAX_DAILY_LOSS_PCT',2)/100; self.maxloss=I('MAX_CONSECUTIVE_LOSSES',3); self.maxpos=I('PUMP_MAX_POSITIONS',2); self.lev=I('PUMP_LEVERAGE',2)
         self.tp1=F('TP1_R',1); self.tp2=F('TP2_R',2); self.tp3=F('TP3_R',3.5); self.tq1=F('TP1_CLOSE_PCT',.35); self.tq2=F('TP2_CLOSE_PCT',.35); self.trail=F('TRAILING_ATR_MULT',1.5); self.sl=F('PUMP_SL_ATR_MULT',1.8); self.ssl=F('SHORT_SL_ATR_MULT',1.5)
         self.confirm=max(1,I('SIGNAL_CONFIRM_CYCLES',2)); self.long_confirm=max(1,I('LONG_SIGNAL_CONFIRM_CYCLES',2)); self.short_confirm=max(1,I('SHORT_SIGNAL_CONFIRM_CYCLES',2)); self.ml=None; self.ml_min=F('ML_MIN_PROBABILITY',.58)
         self.day_realized=0.0; self.day_start_equity=None; self.closed_trades=0; self.seen_execution_ids=set(); self._restore_risk_state()
-        logging.info('STRATEGY CONFIG | schema=2 | long_confirm=%s | short_confirm=%s | long_vol=%.2f | long_m3_min=%.3f%% | long_m5_min=%.3f%% | long_score_min=%.3f | short_m5_min=%.3f%% | short_rsi_min=%.1f | risk_per_trade=%.3f%% | daily_loss_limit=%.3f%% | max_consecutive_losses=%s | leverage=%s',
-                     self.long_confirm,self.short_confirm,self.vol,F('PUMP_LONG_MIN_3M_MOVE_PCT',self.m3*100),F('PUMP_LONG_MIN_5M_MOVE_PCT',0.40),
-                     F('PUMP_LONG_MIN_SCORE',0.45),F('PUMP_SHORT_MIN_5M_MOVE_PCT',0.8),F('PUMP_SHORT_MIN_RSI',65),
+        logging.info('STRATEGY CONFIG | schema=2 | long_confirm=%s | short_confirm=%s | long_vol=%.2f | long_m3_min=%.3f%% | long_m5_min=%.3f%% | long_rsi_max=%.1f | long_score_min=%.3f | btc_regime=%s | short_m5_min=%.3f%% | short_rsi_min=%.1f | risk_per_trade=%.3f%% | daily_loss_limit=%.3f%% | max_consecutive_losses=%s | leverage=%s',
+                     self.long_confirm,self.short_confirm,F('PUMP_LONG_MIN_VOLUME_RATIO',1.2),F('PUMP_LONG_MIN_3M_MOVE_PCT',0.03),F('PUMP_LONG_MIN_5M_MOVE_PCT',0.10),
+                     F('PUMP_LONG_MAX_RSI',72),F('PUMP_LONG_MIN_SCORE',0.0),B('BTC_REGIME_ENABLED',True),F('PUMP_SHORT_MIN_5M_MOVE_PCT',0.8),F('PUMP_SHORT_MIN_RSI',65),
                      self.risk*100,self.dayloss*100,self.maxloss,self.lev)
         path=os.getenv('ML_MODEL_PATH','models/pump_classifier.joblib')
         if B('ML_ENABLED',True) and joblib and os.path.exists(path):
@@ -92,19 +112,38 @@ class Engine:
             o=self.c.fetch_order_book(s,limit=50); b=sum(float(q)*float(px) for px,q in o.get('bids',[]) if float(px)>=p*(1-self.depth/100)); a=sum(float(q)*float(px) for px,q in o.get('asks',[]) if float(px)<=p*(1+self.depth/100)); bid=o.get('bids',[[p,0]])[0][0]; ask=o.get('asks',[[p,0]])[0][0]; v=b/max(a+b,1e-12); sp=(ask-bid)/p*100; self.book_cache[s]=(now,v,sp); return v,sp
         except RateLimitExceeded:raise
         except Exception:self._diag('book_fetch_failed');return .5,999
+    def btc_regime(self):
+        if not B('BTC_REGIME_ENABLED',True):
+            return {'available':True,'ret15_pct':0.0,'ret30_pct':0.0}
+        now=time.time(); hit=self.btc_regime_cache
+        ttl=max(5,I('BTC_REGIME_CACHE_SEC',20))
+        if hit and now-hit[0]<ttl:return hit[1]
+        try:
+            rows=self.ohlcv(os.getenv('BTC_REGIME_SYMBOL','BTC/USDT:USDT'),60)
+            closes=np.asarray([float(z[4]) for z in rows],float)
+            if len(closes)<31:raise RuntimeError('insufficient BTC candles')
+            data={'available':True,'ret15_pct':(closes[-1]/closes[-16]-1)*100,
+                  'ret30_pct':(closes[-1]/closes[-31]-1)*100}
+            self.btc_regime_cache=(now,data)
+            return data
+        except Exception:
+            logging.exception('BTC REGIME READ FAILED')
+            return {'available':False,'ret15_pct':0.0,'ret30_pct':0.0}
+
     def signal(self,s):
         x=self.ohlcv(s)
         if len(x)<30:self._diag('insufficient_ohlcv');return None
-        c=np.array([z[4] for z in x],float); o=np.array([z[1] for z in x]); v=np.array([z[5] for z in x]); p=float(c[-1]); a=self.atr(x); r=self.rsi(c); vr=v[-1]/max(v[-21:-1].mean(),1e-12); m1=c[-1]/c[-2]-1; m3=c[-1]/c[-4]-1; m5=c[-1]/c[-6]-1
+        self.signal_rows_cache[s]=x
+        c=np.array([z[4] for z in x],float); o=np.array([z[1] for z in x]); h=np.array([z[2] for z in x],float); l=np.array([z[3] for z in x],float); p=float(c[-1]); a=self.atr(x); r=self.rsi(c); vr=volume_activity_ratio(x); m1=c[-1]/c[-2]-1; m3=c[-1]/c[-4]-1; m5=c[-1]/c[-6]-1
         vw=sum(((z[2]+z[3]+z[4])/3)*z[5] for z in x[-30:])/max(sum(z[5] for z in x[-30:]),1e-12); vd=abs(p/vw-1)*100; green=sum(c[-2:] > o[-2:]); br=p>=max(c[-self.brk-1:-1]); failed=max(c[-6:])>=max(c[-self.brk-2:-2]) and p<c[-2]
         reversal=((c[-1]<o[-1] and c[-2]<o[-2]) or (p<c[-2] and c[-1]<c[-2]))
         short_vwap=vd>=F('PUMP_MIN_SHORT_DISTANCE_FROM_VWAP_PCT',0.5)
         pre_long,checks=long_continuation_gate(
-            m1,m3,m5,r,vr,br,green,vd,self.vol,
-            F('PUMP_LONG_MIN_3M_MOVE_PCT',self.m3*100),
-            F('PUMP_LONG_MIN_5M_MOVE_PCT',0.40),
+            m1,m3,m5,r,vr,br,green,vd,F('PUMP_LONG_MIN_VOLUME_RATIO',1.2),
+            F('PUMP_LONG_MIN_3M_MOVE_PCT',0.03),
+            F('PUMP_LONG_MIN_5M_MOVE_PCT',0.10),
             F('PUMP_LONG_MIN_RSI',self.rmin),
-            F('PUMP_LONG_MAX_RSI',min(self.rmax,78)),
+            F('PUMP_LONG_MAX_RSI',72),
             F('PUMP_LONG_MAX_VWAP_DISTANCE_PCT',3.0),
             F('PUMP_LONG_MAX_5M_MOVE_PCT',self.m5*100),
         )
@@ -141,12 +180,46 @@ class Engine:
         if not short:self._diag('short_flow_or_book_failed')
         if long and short:self._diag('signal_conflict');logging.warning('SIGNAL CONFLICT | %s',s);return None
         if not(long or short):self._diag('flow_filter_failed');return None
-        side='long' if long else 'short'; q=flow if long else 1-flow; bi=book if long else 1-book; score=min(.3*min(vr/5,1)+.2*min(abs(m5)/.05,1)+.25*q+.15*max((bi-.5)*2,0)+.1,1)
-        if side=='long' and score<F('PUMP_LONG_MIN_SCORE',0.45):
-            self._diag('long_score_failed'); logging.info('LONG REJECT | %s | reasons=score | score=%.3f | min=%.3f',s,score,F('PUMP_LONG_MIN_SCORE',0.45)); return None
-        logging.info('SIGNAL FEATURES | %s | side=%s | score=%.3f | rsi=%.2f | vol=%.3f | flow=%.3f | book=%.3f | vwap=%.3f%% | m1=%.3f%% | m3=%.3f%% | m5=%.3f%% | atr=%.8f | spread=%.4f%%',
-                     s,side,score,r,vr,flow,book,vd,m1*100,m3*100,m5*100,a,sp)
-        return Signal(s,side,p,a,r,vr,flow,book,vd,m5*100,score,'continuation' if long else 'exhaustion',m1*100,m3*100,sp,0.)
+        side='long' if long else 'short'
+        regime=self.btc_regime()
+        if not regime.get('available'):
+            if B('BTC_REGIME_REQUIRED',True):
+                self._diag('btc_regime_unavailable'); logging.warning('BTC REGIME REJECT | %s | side=%s | unavailable',s,side); return None
+        else:
+            allowed,regime_checks=btc_regime_gate(
+                regime['ret15_pct'],regime['ret30_pct'],side,
+                F('BTC_LONG_MIN_15M_RETURN_PCT',-0.15),F('BTC_LONG_MIN_30M_RETURN_PCT',-0.05),
+                F('BTC_SHORT_MAX_15M_RETURN_PCT',0.15),F('BTC_SHORT_MAX_30M_RETURN_PCT',0.05),
+            )
+            if B('BTC_REGIME_ENABLED',True) and not allowed:
+                reasons=[k for k,vv in regime_checks.items() if not vv]
+                self._diag('btc_regime_failed')
+                logging.info('BTC REGIME REJECT | %s | side=%s | reasons=%s | btc15=%.3f%% | btc30=%.3f%%',
+                             s,side,','.join(reasons),regime['ret15_pct'],regime['ret30_pct'])
+                return None
+        q=flow if long else 1-flow; bi=book if long else 1-book; score=min(.3*min(vr/5,1)+.2*min(abs(m5)/.05,1)+.25*q+.15*max((bi-.5)*2,0)+.1,1)
+        long_score_min=F('PUMP_LONG_MIN_SCORE',0.0)
+        if side=='long' and long_score_min>0 and score<long_score_min:
+            self._diag('long_score_failed'); logging.info('LONG REJECT | %s | reasons=score | score=%.3f | min=%.3f',s,score,long_score_min); return None
+        direction=1 if side=='long' else -1
+        atr_distance=a*(self.sl if side=='long' else self.ssl)
+        lookback=max(2,I('STRUCTURE_STOP_LOOKBACK',5))
+        buffer_atr=F('STRUCTURE_STOP_BUFFER_ATR',0.20)
+        if side=='long':
+            structural=max(0.0,p-(float(np.min(l[-lookback-1:-1]))-a*buffer_atr))
+        else:
+            structural=max(0.0,(float(np.max(h[-lookback-1:-1]))+a*buffer_atr)-p)
+        stop_distance=max(atr_distance,structural)
+        max_stop=a*F('MAX_STOP_ATR_MULT',3.0)
+        if stop_distance>max_stop:
+            self._diag('structure_stop_too_wide')
+            logging.info('SIGNAL REJECT | %s | side=%s | reason=structure_stop_too_wide | stop_atr=%.2f | max=%.2f',
+                         s,side,stop_distance/max(a,1e-12),max_stop/max(a,1e-12))
+            return None
+        logging.info('SIGNAL FEATURES | %s | side=%s | score=%.3f | rsi=%.2f | vol=%.3f | flow=%.3f | book=%.3f | vwap=%.3f%% | m1=%.3f%% | m3=%.3f%% | m5=%.3f%% | atr=%.8f | stop_atr=%.2f | btc15=%.3f%% | btc30=%.3f%% | spread=%.4f%%',
+                     s,side,score,r,vr,flow,book,vd,m1*100,m3*100,m5*100,a,stop_distance/max(a,1e-12),
+                     regime.get('ret15_pct',0),regime.get('ret30_pct',0),sp)
+        return Signal(s,side,p,a,r,vr,flow,book,vd,m5*100,score,'continuation' if long else 'exhaustion',m1*100,m3*100,sp,0.,stop_distance)
     def _journal_raw(self,event,extra=None):
         path=os.getenv('TRADE_JOURNAL_PATH','data/trades.jsonl')
         os.makedirs(os.path.dirname(path) or '.',exist_ok=True)
@@ -203,7 +276,7 @@ class Engine:
                     for key in ('signal_time','order_time','fill_time','entry_price','entry_qty','tp1_price','tp2_price','tp3_price','sl_price',
                                 'exit_price','exit_time','exit_reason','realized_pnl','fees','mfe_pct','mae_pct','duration_sec','ml_probability','rsi',
                                 'volume_ratio','flow','book','spread','vwap_distance_pct','move1_pct','move3_pct','move5_pct','trade_status',
-                                'entry_fees','exit_fees','initial_qty','current_qty','exit_filled_qty','tp_hits','stop_moved_to_be','tp_order_ids','tp_plan'):
+                                'entry_fees','exit_fees','initial_qty','current_qty','exit_filled_qty','tp_hits','stop_moved_to_be','profit_protected','trailing_armed','trailing_distance','tp_order_ids','tp_plan'):
                         if key in rec:setattr(p,key,rec.get(key))
                     p.seen_execution_ids=set()
                     self.pos[p.symbol]=p
@@ -269,7 +342,7 @@ class Engine:
             return
         logging.info('RISK SNAPSHOT | symbol=%s | equity=%.6f | day_start_equity=%s | day_realized=%.6f | consecutive_losses=%s/%s | risk_per_trade=%.3f%%',
                      s.symbol,e,self.day_start_equity,self.day_realized,self.losses,self.maxloss,self.risk*100)
-        d=s.atr*(self.ssl if s.side=='short' else self.sl); q=e*self.risk/d if e and d else 0; m=self.c.market(s.symbol); amin=float(((m.get('limits',{}).get('amount') or {}).get('min')) or 0); q=float(self.c.amount_to_precision(s.symbol,max(q,amin)))
+        d=float(getattr(s,'stop_distance',0) or 0) or s.atr*(self.ssl if s.side=='short' else self.sl); q=e*self.risk/d if e and d else 0; m=self.c.market(s.symbol); amin=float(((m.get('limits',{}).get('amount') or {}).get('min')) or 0); q=float(self.c.amount_to_precision(s.symbol,max(q,amin)))
         if e<=0 or d<=0:
             logging.warning('ORDER BLOCKED | invalid sizing inputs | symbol=%s | equity=%.4f | atr=%.8f | risk_pct=%.4f',s.symbol,e,s.atr,self.risk)
             if self.alert:self.alert(f'🟡 ORDER BLOCKED | {s.symbol} | balance/ATR unavailable')
@@ -308,7 +381,7 @@ class Engine:
         p.entry_price=en; p.entry_qty=q
         p.tp1_price=t1; p.tp2_price=t2; p.tp3_price=t3; p.sl_price=stop
         p.tp1_fill_qty=0.0; p.tp2_fill_qty=0.0; p.tp3_fill_qty=0.0
-        p.exit_price=None; p.exit_time=None; p.exit_reason=None; p.realized_pnl=0.0; p.fees=0.0; p.entry_fees=0.0; p.exit_fees=0.0; p.initial_qty=q; p.current_qty=q; p.exit_filled_qty=0.0; p.seen_execution_ids=set(); p.tp_hits=[]; p.stop_moved_to_be=False; p.tp_order_ids={}; p.tp_plan={}
+        p.exit_price=None; p.exit_time=None; p.exit_reason=None; p.realized_pnl=0.0; p.fees=0.0; p.entry_fees=0.0; p.exit_fees=0.0; p.initial_qty=q; p.current_qty=q; p.exit_filled_qty=0.0; p.seen_execution_ids=set(); p.tp_hits=[]; p.stop_moved_to_be=False; p.profit_protected=False; p.trailing_armed=False; p.trailing_distance=0.0; p.tp_order_ids={}; p.tp_plan={}
         p.mfe_pct=0.0; p.mae_pct=0.0; p.duration_sec=None
         p.ml_probability=s.ml_prob; p.rsi=s.rsi; p.volume_ratio=s.vol; p.flow=s.flow; p.book=s.book; p.spread=s.spread
         p.vwap_distance_pct=s.vwap; p.move1_pct=s.m1; p.move3_pct=s.m3; p.move5_pct=s.move5
